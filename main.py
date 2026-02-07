@@ -1,13 +1,136 @@
-from fastapi import FastAPI
+import os
+import socket
+from datetime import datetime, timezone
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from app.db import Base, engine
+from app.db import Base, engine, ensure_sqlite_schema
 from app.api import media, device, playlist, schedule, screen
 from app.services.storage import ensure_storage
+from app.services.realtime import hub
 
 Base.metadata.create_all(bind=engine)
+ensure_sqlite_schema()
 ensure_storage()
 
+API_KEY = os.getenv("SIGNAGE_API_KEY", "").strip()
+SERVER_PORT = int(os.getenv("SIGNAGE_SERVER_PORT", "8000"))
+
+
+def _local_ipv4_addresses() -> list[str]:
+    candidates: set[str] = set()
+    try:
+        host = socket.gethostname()
+        for entry in socket.getaddrinfo(host, None, family=socket.AF_INET):
+            ip = entry[4][0]
+            if ip and ip != "127.0.0.1":
+                candidates.add(ip)
+    except Exception:
+        pass
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("8.8.8.8", 80))
+            ip = sock.getsockname()[0]
+            if ip and ip != "127.0.0.1":
+                candidates.add(ip)
+    except Exception:
+        pass
+
+    return sorted(candidates)
+
+
+def _is_private_ip(ip: str) -> bool:
+    return ip.startswith("10.") or ip.startswith("192.168.") or ip.startswith("172.")
+
+
+def _primary_ip() -> str:
+    ips = _local_ipv4_addresses()
+    for ip in ips:
+        if _is_private_ip(ip):
+            return ip
+    if ips:
+        return ips[0]
+    return "127.0.0.1"
+
 app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/")
+def root():
+    return {
+        "ok": True,
+        "service": "signage-api",
+        "time_utc": datetime.now(timezone.utc).isoformat(),
+        "docs": "/docs",
+    }
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True, "server_ip": _primary_ip(), "server_port": SERVER_PORT}
+
+
+@app.get("/server-info")
+def server_info():
+    ip = _primary_ip()
+    return {
+        "ok": True,
+        "server_ip": ip,
+        "server_port": SERVER_PORT,
+        "base_url": f"http://{ip}:{SERVER_PORT}",
+        "ips": _local_ipv4_addresses(),
+        "realtime_ws": f"ws://{ip}:{SERVER_PORT}/ws/updates",
+        "revision": hub.revision,
+    }
+
+
+@app.websocket("/ws/updates")
+async def ws_updates(websocket: WebSocket):
+    await hub.connect(websocket)
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        await hub.disconnect(websocket)
+    except Exception:
+        await hub.disconnect(websocket)
+
+@app.middleware("http")
+async def api_key_middleware(request: Request, call_next):
+    if not API_KEY:
+        return await call_next(request)
+    path = request.url.path
+    if path.startswith("/docs") or path.startswith("/openapi.json") or path.startswith("/redoc") or path.startswith("/storage"):
+        return await call_next(request)
+    if request.headers.get("X-API-Key") != API_KEY:
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+    return await call_next(request)
+
+
+@app.middleware("http")
+async def realtime_mutation_middleware(request: Request, call_next):
+    response = await call_next(request)
+    method = request.method.upper()
+    path = request.url.path
+    if response.status_code < 400 and method in {"POST", "PUT", "DELETE"}:
+        watched_prefixes = ("/playlists", "/schedules", "/screens", "/devices", "/media")
+        if path.startswith(watched_prefixes):
+            await hub.publish(
+                "config_changed",
+                {
+                    "path": path,
+                    "method": method,
+                },
+            )
+    return response
+
 app.include_router(media.router)
 app.include_router(device.router)
 app.include_router(playlist.router)

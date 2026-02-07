@@ -1,10 +1,9 @@
 from pydantic import BaseModel
-from uuid import UUID
 
 class PlaylistItemOut(BaseModel):
-    id: UUID
-    playlist_id: UUID
-    media_id: UUID
+    id: str
+    playlist_id: str
+    media_id: str
     order: int
     duration_sec: int | None = None
     enabled: bool
@@ -13,8 +12,8 @@ class PlaylistItemOut(BaseModel):
         from_attributes = True
 
 class PlaylistOut(BaseModel):
-    id: UUID
-    screen_id: UUID
+    id: str
+    screen_id: str
     name: str
 
     class Config:

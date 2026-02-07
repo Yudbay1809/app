@@ -1,13 +1,20 @@
-from pydantic import BaseModel
-from uuid import UUID
+from pydantic import BaseModel, Field
 from datetime import datetime
 
+class DeviceRegisterIn(BaseModel):
+    name: str = Field(..., min_length=1)
+    location: str = ""
+    orientation: str = "portrait"
+    account_id: str | None = None
+
 class DeviceOut(BaseModel):
-    id: UUID
+    id: str
     name: str
     location: str | None = None
     last_seen: datetime | None = None
     status: str
+    orientation: str | None = None
+    owner_account: str | None = None
 
     class Config:
         from_attributes = True

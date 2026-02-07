@@ -8,5 +8,7 @@ class Device(Base):
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     name = Column(String, nullable=False)
     location = Column(String)
+    owner_account = Column(String, nullable=True)
     last_seen = Column(DateTime)
     status = Column(String, default="offline")
+    orientation = Column(String, default="portrait")

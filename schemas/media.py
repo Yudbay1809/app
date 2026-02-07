@@ -1,8 +1,7 @@
 from pydantic import BaseModel
-from uuid import UUID
 
 class MediaOut(BaseModel):
-    id: UUID
+    id: str
     name: str
     type: str
     path: str
