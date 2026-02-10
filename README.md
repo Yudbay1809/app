@@ -1,38 +1,55 @@
-# Signage Backend API
+﻿# Digital Signage Backend API
 
-Backend FastAPI untuk mengelola media, playlist, schedule, dan device pada sistem digital signage.
+Backend FastAPI untuk orkestrasi media, playlist, schedule, device, dan realtime update pada sistem digital signage.
 
-## Fitur Utama
-- Manajemen media upload/hapus dengan checksum
-- Manajemen device + orientasi layar
-- Playlist dan schedule per device
-- Realtime update via WebSocket (`/ws/updates`)
-- Endpoint server discovery (`/server-info`, `/healthz`)
-- Pagination media untuk scale besar (`/media/page`)
+## Highlights
+- Device provisioning + ownership guard (`/devices/register`, `/devices/{id}`)
+- Media management dengan checksum + pagination untuk katalog besar
+- Playlist management (create, rename, reorder, add/remove item)
+- Scheduling engine per screen (hari + rentang waktu)
+- Grid preset dengan validasi orientasi device (portrait/landscape)
+- Realtime broadcast perubahan konfigurasi via WebSocket (`/ws/updates`)
+- Server discovery endpoint untuk auto base-url pada player (`/server-info`, `/healthz`)
 
-## Arsitektur Singkat
-- `api/` endpoint REST
-- `models/` SQLAlchemy model
-- `schemas/` validasi request/response
-- `services/` storage dan realtime hub
-- Database default: SQLite (`signage.db`)
+## Tech Stack
+- FastAPI
+- SQLAlchemy ORM
+- SQLite (default development)
+- Uvicorn
 
-## Endpoint Penting
+## Project Structure
+- `api/` REST endpoints
+- `models/` SQLAlchemy models
+- `schemas/` response/request schemas
+- `services/` realtime hub + storage helper
+- `db.py` bootstrap database + migration ringan
+- `main.py` app entrypoint
+
+## Main Endpoints
 - `GET /healthz`
 - `GET /server-info`
-- `GET /media/page?offset=0&limit=120&q=&type=all`
 - `POST /devices/register`
 - `GET /devices/{device_id}/config`
+- `GET /media/page?offset=0&limit=120&q=&type=all`
+- `POST /playlists/{playlist_id}/items`
+- `GET /playlists/{playlist_id}/items`
+- `PUT /playlists/items/{item_id}`
+- `DELETE /playlists/items/{item_id}`
 - `WS /ws/updates`
 
-## Quick Start
+## Local Run
 ```bash
 cd "D:\APP Video Promosi"
 .\app\.venv\Scripts\python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-## Catatan Produksi
-- Gunakan PostgreSQL saat jumlah media/device bertambah besar
-- Aktifkan HTTPS reverse proxy (Nginx/Caddy) untuk deployment publik
-- Simpan `SIGNAGE_API_KEY` untuk proteksi API
+## Production Checklist
+- Ganti SQLite ke PostgreSQL untuk skala besar
+- Jalankan di balik reverse proxy (Nginx/Caddy)
+- Aktifkan HTTPS/TLS pada public deployment
+- Set `SIGNAGE_API_KEY` untuk proteksi API
+- Batasi firewall hanya port yang dibutuhkan (contoh 8000 private LAN)
 
+## Notes
+- Repo ini fokus backend API; desktop/mobile player berada pada repository/folder terpisah.
+- Untuk sinkronisasi real-time stabil, pastikan dependensi websocket (`websockets`/`uvicorn[standard]`) terpasang.

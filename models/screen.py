@@ -7,3 +7,5 @@ class Screen(Base):
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     device_id = Column(String(36), ForeignKey("device.id"), nullable=False)
     name = Column(String, nullable=False)
+    active_playlist_id = Column(String(36), nullable=True)
+    grid_preset = Column(String(16), default="1x1")

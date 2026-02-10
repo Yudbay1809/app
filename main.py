@@ -1,12 +1,16 @@
 import os
 import socket
+import asyncio
+import logging
 from datetime import datetime, timezone
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from app.db import Base, engine, ensure_sqlite_schema
+from app.db import SessionLocal
 from app.api import media, device, playlist, schedule, screen
+from app.models.device import Device
 from app.services.storage import ensure_storage
 from app.services.realtime import hub
 
@@ -16,6 +20,21 @@ ensure_storage()
 
 API_KEY = os.getenv("SIGNAGE_API_KEY", "").strip()
 SERVER_PORT = int(os.getenv("SIGNAGE_SERVER_PORT", "8000"))
+DEVICE_OFFLINE_AFTER_SEC = int(os.getenv("SIGNAGE_DEVICE_OFFLINE_AFTER_SEC", "70"))
+DEVICE_STATUS_SWEEP_SEC = int(os.getenv("SIGNAGE_DEVICE_STATUS_SWEEP_SEC", "5"))
+QUIET_ACCESS_LOG = os.getenv("SIGNAGE_QUIET_ACCESS_LOG", "1").strip().lower() in {"1", "true", "yes", "on"}
+QUIET_WEBSOCKET_LOG = os.getenv("SIGNAGE_QUIET_WEBSOCKET_LOG", "1").strip().lower() in {"1", "true", "yes", "on"}
+_device_status_task: asyncio.Task | None = None
+
+if QUIET_ACCESS_LOG:
+    # Keep warning/error lines, suppress normal access noise (200/201 etc).
+    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+
+if QUIET_WEBSOCKET_LOG:
+    # Intermittent network drop (e.g. WinError 121) can emit noisy stack traces from
+    # the websocket transport layer even though reconnect logic is already in place.
+    logging.getLogger("websockets").setLevel(logging.CRITICAL)
+    logging.getLogger("uvicorn.protocols.websockets").setLevel(logging.CRITICAL)
 
 
 def _local_ipv4_addresses() -> list[str]:
@@ -53,6 +72,49 @@ def _primary_ip() -> str:
     if ips:
         return ips[0]
     return "127.0.0.1"
+
+
+def _derive_device_status(last_seen: datetime | None, now_utc: datetime) -> str:
+    if last_seen is None:
+        return "offline"
+    age = (now_utc - last_seen).total_seconds()
+    return "online" if age <= DEVICE_OFFLINE_AFTER_SEC else "offline"
+
+
+async def _device_status_watcher() -> None:
+    while True:
+        await asyncio.sleep(DEVICE_STATUS_SWEEP_SEC)
+        changed_payload: list[dict[str, str | None]] = []
+        db = SessionLocal()
+        try:
+            now = datetime.utcnow()
+            devices = db.query(Device).all()
+            for item in devices:
+                next_status = _derive_device_status(item.last_seen, now)
+                if item.status != next_status:
+                    item.status = next_status
+                    changed_payload.append(
+                        {
+                            "device_id": str(item.id),
+                            "status": next_status,
+                            "last_seen": item.last_seen.isoformat() if item.last_seen else None,
+                        }
+                    )
+            if changed_payload:
+                db.commit()
+        except Exception:
+            db.rollback()
+        finally:
+            db.close()
+
+        if changed_payload:
+            await hub.publish(
+                "device_status_changed",
+                {
+                    "changes": changed_payload,
+                    "offline_after_sec": DEVICE_OFFLINE_AFTER_SEC,
+                },
+            )
 
 app = FastAPI()
 app.add_middleware(
@@ -101,6 +163,25 @@ async def ws_updates(websocket: WebSocket):
         await hub.disconnect(websocket)
     except Exception:
         await hub.disconnect(websocket)
+
+
+@app.on_event("startup")
+async def startup_events() -> None:
+    global _device_status_task
+    if _device_status_task is None or _device_status_task.done():
+        _device_status_task = asyncio.create_task(_device_status_watcher())
+
+
+@app.on_event("shutdown")
+async def shutdown_events() -> None:
+    global _device_status_task
+    if _device_status_task is not None:
+        _device_status_task.cancel()
+        try:
+            await _device_status_task
+        except asyncio.CancelledError:
+            pass
+        _device_status_task = None
 
 @app.middleware("http")
 async def api_key_middleware(request: Request, call_next):

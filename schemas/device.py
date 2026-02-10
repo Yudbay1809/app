@@ -9,6 +9,8 @@ class DeviceRegisterIn(BaseModel):
 
 class DeviceOut(BaseModel):
     id: str
+    legacy_id: str | None = None
+    client_ip: str | None = None
     name: str
     location: str | None = None
     last_seen: datetime | None = None

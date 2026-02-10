@@ -8,6 +8,7 @@ venv/
 
 signage.db
 *.db
+signage.db.bak*
 
 storage/
 *.log
