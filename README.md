@@ -40,7 +40,18 @@ Backend FastAPI untuk orkestrasi media, playlist, schedule, device, dan realtime
 ## Local Run
 ```bash
 cd "D:\APP Video Promosi"
-.\app\.venv\Scripts\python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+.\app\.venv\Scripts\python.exe -m pip install -r .\app\requirements.txt
+.\app\.venv\Scripts\python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+## VS Code Interpreter (Important)
+- Open folder: `D:\APP Video Promosi\app`
+- Select Python interpreter: `D:\APP Video Promosi\app\.venv\Scripts\python.exe`
+- If import error remains (for example `from sqlalchemy.orm import Session`), run:
+
+```bash
+cd "D:\APP Video Promosi\app"
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
 ## Production Checklist
