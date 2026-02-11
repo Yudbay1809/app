@@ -86,6 +86,9 @@ cd "D:\APP Video Promosi\app"
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
+## Maintainer
+- Yudbay1809
+
 ## Security
 Report vulnerabilities privately following `SECURITY.md`.
 
