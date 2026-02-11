@@ -5,7 +5,7 @@
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.128-009688)
 ![License](https://img.shields.io/badge/license-MIT-informational)
 
-FastAPI backend for digital signage operations: media catalog, playlists, schedules, device registration, and realtime config updates.
+FastAPI backend for digital signage operations: media catalog, playlists, schedules, device registration, Flash Sale campaign, and realtime config updates.
 
 ## Features
 - Device provisioning with ownership guard
@@ -13,6 +13,7 @@ FastAPI backend for digital signage operations: media catalog, playlists, schedu
 - Playlist and playlist-item management
 - Screen schedule orchestration
 - Screen grid + transition duration control (`transition_duration_sec`, range `0..30`)
+- Device-level Flash Sale campaign (independent from playlist)
 - Realtime update broadcast over WebSocket
 - Health and server discovery endpoints
 
@@ -49,6 +50,9 @@ Open docs:
 - `POST /devices/register`
 - `POST /devices/{device_id}/heartbeat`
 - `GET /devices/{device_id}/config`
+- `PUT /flash-sale/device/{device_id}/now`
+- `PUT /flash-sale/device/{device_id}/schedule`
+- `DELETE /flash-sale/device/{device_id}`
 - `GET /screens?device_id=<device_id>`
 - `PUT /screens/{screen_id}?grid_preset=2x2&transition_duration_sec=2`
 - `GET /media/page`
@@ -63,6 +67,15 @@ Open docs:
   - `POST /screens`
   - `PUT /screens/{screen_id}`
   - `GET /devices/{device_id}/config` inside each screen object
+
+## Flash Sale Campaign
+- Flash Sale is configured per-device and decoupled from playlist.
+- Campaign payload supports:
+  - `note` (running text)
+  - `countdown_sec`
+  - `products_json` (must include `media_id` per product)
+  - optional schedule (`schedule_days`, `start_time`, `end_time`)
+- Runtime status is exposed in `GET /devices/{device_id}/config` under top-level `flash_sale`.
 
 ## VS Code Setup
 - Open folder: `D:\APP Video Promosi\app`
