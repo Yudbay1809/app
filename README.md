@@ -12,6 +12,7 @@ FastAPI backend for digital signage operations: media catalog, playlists, schedu
 - Media upload/catalog with checksum and pagination
 - Playlist and playlist-item management
 - Screen schedule orchestration
+- Screen grid + transition duration control (`transition_duration_sec`, range `0..30`)
 - Realtime update broadcast over WebSocket
 - Health and server discovery endpoints
 
@@ -48,8 +49,20 @@ Open docs:
 - `POST /devices/register`
 - `POST /devices/{device_id}/heartbeat`
 - `GET /devices/{device_id}/config`
+- `GET /screens?device_id=<device_id>`
+- `PUT /screens/{screen_id}?grid_preset=2x2&transition_duration_sec=2`
 - `GET /media/page`
 - `WS /ws/updates`
+
+## Screen Transition Duration
+- Field: `transition_duration_sec` (seconds)
+- Allowed range: `0..30`
+- Default: `1`
+- Available in:
+  - `GET /screens`
+  - `POST /screens`
+  - `PUT /screens/{screen_id}`
+  - `GET /devices/{device_id}/config` inside each screen object
 
 ## VS Code Setup
 - Open folder: `D:\APP Video Promosi\app`

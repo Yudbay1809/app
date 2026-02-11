@@ -1,17 +1,20 @@
+import json
 import os
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 from app.db import SessionLocal
 from app.models.device import Device
+from app.models.flash_sale import FlashSaleConfig
 from app.models.screen import Screen
 from app.models.schedule import Schedule
 from app.models.playlist import Playlist, PlaylistItem
 from app.models.media import Media
 from app.schemas.device import DeviceRegisterIn
-from datetime import datetime
+from datetime import datetime, timedelta
 
 router = APIRouter(prefix="/devices", tags=["devices"])
 DEVICE_OFFLINE_AFTER_SEC = int(os.getenv("SIGNAGE_DEVICE_OFFLINE_AFTER_SEC", "70"))
+DEFAULT_TRANSITION_DURATION_SEC = 1
 
 def get_db():
     db = SessionLocal()
@@ -82,6 +85,93 @@ def _sync_runtime_status(device: Device, now: datetime | None = None) -> bool:
         device.status = next_status
         return True
     return False
+
+
+def _parse_hms(value: str) -> tuple[int, int, int] | None:
+    raw = (value or "").strip()
+    parts = raw.split(":")
+    if len(parts) not in (2, 3):
+        return None
+    try:
+        hour = int(parts[0])
+        minute = int(parts[1])
+        second = int(parts[2]) if len(parts) == 3 else 0
+    except ValueError:
+        return None
+    if hour < 0 or hour > 23 or minute < 0 or minute > 59 or second < 0 or second > 59:
+        return None
+    return hour, minute, second
+
+
+def _resolve_flash_sale_runtime(config: FlashSaleConfig | None, now: datetime) -> dict | None:
+    if not config:
+        return None
+    enabled = bool(config.enabled)
+    countdown_sec = config.countdown_sec if (config.countdown_sec or 0) > 0 else None
+    active = False
+    runtime_start: datetime | None = None
+    runtime_end: datetime | None = None
+    countdown_end: datetime | None = None
+
+    has_schedule = bool(
+        (config.schedule_days or "").strip()
+        and (config.schedule_start_time or "").strip()
+        and (config.schedule_end_time or "").strip()
+    )
+    if enabled and has_schedule:
+        allowed_days: set[int] = set()
+        for item in (config.schedule_days or "").split(","):
+            value = item.strip()
+            if not value:
+                continue
+            try:
+                day = int(value)
+            except ValueError:
+                continue
+            if 0 <= day <= 6:
+                allowed_days.add(day)
+        hms_start = _parse_hms(config.schedule_start_time or "")
+        hms_end = _parse_hms(config.schedule_end_time or "")
+        if allowed_days and hms_start and hms_end:
+            now_day = now.weekday() % 7
+            if now_day in allowed_days:
+                start = datetime(now.year, now.month, now.day, hms_start[0], hms_start[1], hms_start[2])
+                end = datetime(now.year, now.month, now.day, hms_end[0], hms_end[1], hms_end[2])
+                if end <= start:
+                    end = end + timedelta(days=1)
+                if (now >= start) and (now < end):
+                    active = True
+                    runtime_start = start
+                    runtime_end = end
+    elif enabled:
+        active = True
+        runtime_start = config.activated_at
+
+    if countdown_sec is not None:
+        if runtime_start is not None:
+            countdown_end = runtime_start + timedelta(seconds=countdown_sec)
+        elif config.activated_at is not None:
+            countdown_end = config.activated_at + timedelta(seconds=countdown_sec)
+        if countdown_end is not None and runtime_end is not None and countdown_end > runtime_end:
+            countdown_end = runtime_end
+        if countdown_end is not None and now >= countdown_end:
+            active = False
+
+    return {
+        "enabled": enabled,
+        "active": active,
+        "note": config.note,
+        "countdown_sec": countdown_sec,
+        "products_json": config.products_json,
+        "schedule_days": config.schedule_days,
+        "schedule_start_time": config.schedule_start_time,
+        "schedule_end_time": config.schedule_end_time,
+        "runtime_start_at": runtime_start.isoformat() if runtime_start else None,
+        "runtime_end_at": runtime_end.isoformat() if runtime_end else None,
+        "countdown_end_at": countdown_end.isoformat() if countdown_end else None,
+        "activated_at": config.activated_at.isoformat() if config.activated_at else None,
+        "updated_at": config.updated_at.isoformat() if config.updated_at else None,
+    }
 
 
 def _next_device_id(db: Session) -> str:
@@ -166,7 +256,11 @@ def register_device(
     db.add(device)
     db.commit()
     db.refresh(device)
-    main_screen = Screen(device_id=device.id, name="Main")
+    main_screen = Screen(
+        device_id=device.id,
+        name="Main",
+        transition_duration_sec=DEFAULT_TRANSITION_DURATION_SEC,
+    )
     db.add(main_screen)
     db.commit()
     return {
@@ -277,6 +371,7 @@ def delete_device(device_id: str, request: Request, account_id: str | None = Non
         db.query(Schedule).filter(Schedule.screen_id.in_(screen_ids)).delete(synchronize_session=False)
         db.query(Screen).filter(Screen.id.in_(screen_ids)).delete(synchronize_session=False)
 
+    db.query(FlashSaleConfig).filter(FlashSaleConfig.device_id == device.id).delete(synchronize_session=False)
     db.delete(device)
     db.commit()
     return {"ok": True}
@@ -320,6 +415,22 @@ def device_config(device_id: str, request: Request, account_id: str | None = Non
                 media_ids.add(it.media_id)
 
     media = []
+    flash_sale_runtime = None
+    flash_sale_config = db.query(FlashSaleConfig).filter(FlashSaleConfig.device_id == device.id).first()
+    flash_sale_runtime = _resolve_flash_sale_runtime(flash_sale_config, datetime.utcnow())
+    if flash_sale_runtime and flash_sale_runtime.get("products_json"):
+        try:
+            rows = json.loads(flash_sale_runtime["products_json"])
+            if isinstance(rows, list):
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    media_id = str(row.get("media_id", "")).strip()
+                    if media_id:
+                        media_ids.add(media_id)
+        except Exception:
+            pass
+
     if media_ids:
         media = db.query(Media).filter(Media.id.in_(list(media_ids))).all()
 
@@ -340,12 +451,19 @@ def device_config(device_id: str, request: Request, account_id: str | None = Non
                 "name": s.name,
                 "active_playlist_id": str(s.active_playlist_id) if s.active_playlist_id else None,
                 "grid_preset": s.grid_preset or "1x1",
+                "transition_duration_sec": (
+                    s.transition_duration_sec
+                    if s.transition_duration_sec is not None
+                    else DEFAULT_TRANSITION_DURATION_SEC
+                ),
                 "schedules": [
                     {
                         "day_of_week": sc.day_of_week,
                         "start_time": str(sc.start_time),
                         "end_time": str(sc.end_time),
                         "playlist_id": str(sc.playlist_id),
+                        "note": sc.note,
+                        "countdown_sec": sc.countdown_sec,
                     }
                     for sc in schedules if sc.screen_id == s.id
                 ],
@@ -357,6 +475,10 @@ def device_config(device_id: str, request: Request, account_id: str | None = Non
                 "id": str(pl.id),
                 "name": pl.name,
                 "screen_id": str(pl.screen_id),
+                "is_flash_sale": bool(pl.is_flash_sale),
+                "flash_note": pl.flash_note,
+                "flash_countdown_sec": pl.flash_countdown_sec,
+                "flash_items_json": pl.flash_items_json,
                 "items": [
                     {
                         "order": it.order,
@@ -378,4 +500,5 @@ def device_config(device_id: str, request: Request, account_id: str | None = Non
             }
             for m in media
         ],
+        "flash_sale": flash_sale_runtime,
     }

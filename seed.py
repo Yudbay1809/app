@@ -22,8 +22,8 @@ def seed() -> None:
         db.commit()
         db.refresh(device)
 
-        screen_a = Screen(device_id=device.id, name="Screen A")
-        screen_b = Screen(device_id=device.id, name="Screen B")
+        screen_a = Screen(device_id=device.id, name="Screen A", transition_duration_sec=1)
+        screen_b = Screen(device_id=device.id, name="Screen B", transition_duration_sec=1)
         db.add(screen_a)
         db.add(screen_b)
         db.commit()

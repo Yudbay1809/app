@@ -5,6 +5,9 @@ from app.models.device import Device
 from app.models.screen import Screen
 
 router = APIRouter(prefix="/screens", tags=["screens"])
+DEFAULT_TRANSITION_DURATION_SEC = 1
+MIN_TRANSITION_DURATION_SEC = 0
+MAX_TRANSITION_DURATION_SEC = 30
 
 
 def get_db():
@@ -52,12 +55,38 @@ def _validate_grid_for_device(device: Device, grid_preset: str) -> str:
     return preset
 
 
+def _validate_transition_duration(value: int | None) -> int:
+    if value is None:
+        return DEFAULT_TRANSITION_DURATION_SEC
+    if value < MIN_TRANSITION_DURATION_SEC or value > MAX_TRANSITION_DURATION_SEC:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Invalid transition_duration_sec. "
+                f"Use range {MIN_TRANSITION_DURATION_SEC}..{MAX_TRANSITION_DURATION_SEC}."
+            ),
+        )
+    return value
+
+
+def _screen_response(screen: Screen) -> dict[str, str | int | None]:
+    return {
+        "id": str(screen.id),
+        "device_id": str(screen.device_id),
+        "name": screen.name,
+        "active_playlist_id": str(screen.active_playlist_id) if screen.active_playlist_id else None,
+        "grid_preset": screen.grid_preset or "1x1",
+        "transition_duration_sec": _validate_transition_duration(screen.transition_duration_sec),
+    }
+
+
 @router.post("")
 def create_screen(
     device_id: str,
     name: str,
     active_playlist_id: str | None = None,
     grid_preset: str = "1x1",
+    transition_duration_sec: int = DEFAULT_TRANSITION_DURATION_SEC,
     db: Session = Depends(get_db),
 ):
     device = db.query(Device).get(device_id)
@@ -68,16 +97,18 @@ def create_screen(
         name=name,
         active_playlist_id=active_playlist_id,
         grid_preset=_validate_grid_for_device(device, grid_preset),
+        transition_duration_sec=_validate_transition_duration(transition_duration_sec),
     )
     db.add(screen)
     db.commit()
     db.refresh(screen)
-    return screen
+    return _screen_response(screen)
 
 
 @router.get("")
 def list_screens(device_id: str, db: Session = Depends(get_db)):
-    return db.query(Screen).filter(Screen.device_id == device_id).all()
+    screens = db.query(Screen).filter(Screen.device_id == device_id).all()
+    return [_screen_response(screen) for screen in screens]
 
 
 @router.put("/{screen_id}")
@@ -86,6 +117,7 @@ def update_screen(
     name: str | None = None,
     active_playlist_id: str | None = None,
     grid_preset: str | None = None,
+    transition_duration_sec: int | None = None,
     db: Session = Depends(get_db),
 ):
     screen = db.query(Screen).get(screen_id)
@@ -100,9 +132,11 @@ def update_screen(
         screen.active_playlist_id = active_playlist_id or None
     if grid_preset is not None:
         screen.grid_preset = _validate_grid_for_device(device, grid_preset)
+    if transition_duration_sec is not None:
+        screen.transition_duration_sec = _validate_transition_duration(transition_duration_sec)
     db.commit()
     db.refresh(screen)
-    return screen
+    return _screen_response(screen)
 
 
 @router.delete("/{screen_id}")

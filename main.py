@@ -9,7 +9,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from app.db import Base, engine, ensure_sqlite_schema
 from app.db import SessionLocal
-from app.api import media, device, playlist, schedule, screen
+from app.api import media, device, playlist, schedule, screen, flash_sale
 from app.models.device import Device
 from app.services.storage import ensure_storage
 from app.services.realtime import hub
@@ -201,7 +201,7 @@ async def realtime_mutation_middleware(request: Request, call_next):
     method = request.method.upper()
     path = request.url.path
     if response.status_code < 400 and method in {"POST", "PUT", "DELETE"}:
-        watched_prefixes = ("/playlists", "/schedules", "/screens", "/devices", "/media")
+        watched_prefixes = ("/playlists", "/schedules", "/screens", "/devices", "/media", "/flash-sale")
         if path.startswith(watched_prefixes):
             await hub.publish(
                 "config_changed",
@@ -217,5 +217,6 @@ app.include_router(device.router)
 app.include_router(playlist.router)
 app.include_router(schedule.router)
 app.include_router(screen.router)
+app.include_router(flash_sale.router)
 
 app.mount("/storage", StaticFiles(directory="storage"), name="storage")

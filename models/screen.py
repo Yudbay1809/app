@@ -1,6 +1,7 @@
 import uuid
-from sqlalchemy import Column, String, ForeignKey
+from sqlalchemy import Column, Integer, String, ForeignKey
 from app.db import Base
+
 
 class Screen(Base):
     __tablename__ = "screen"
@@ -9,3 +10,4 @@ class Screen(Base):
     name = Column(String, nullable=False)
     active_playlist_id = Column(String(36), nullable=True)
     grid_preset = Column(String(16), default="1x1")
+    transition_duration_sec = Column(Integer, default=1)

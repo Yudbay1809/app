@@ -122,9 +122,69 @@ def ensure_sqlite_schema():
             conn.execute(text("ALTER TABLE screen ADD COLUMN active_playlist_id VARCHAR"))
         if "grid_preset" not in screen_col_names:
             conn.execute(text("ALTER TABLE screen ADD COLUMN grid_preset VARCHAR DEFAULT '1x1'"))
+        if "transition_duration_sec" not in screen_col_names:
+            conn.execute(text("ALTER TABLE screen ADD COLUMN transition_duration_sec INTEGER DEFAULT 1"))
         conn.execute(
             text(
                 "UPDATE screen SET grid_preset='1x1' "
                 "WHERE grid_preset IS NULL OR trim(grid_preset)=''"
+            )
+        )
+        conn.execute(
+            text(
+                "UPDATE screen SET transition_duration_sec=1 "
+                "WHERE transition_duration_sec IS NULL"
+            )
+        )
+        conn.execute(
+            text(
+                "UPDATE screen SET transition_duration_sec=0 "
+                "WHERE transition_duration_sec < 0"
+            )
+        )
+        conn.execute(
+            text(
+                "UPDATE screen SET transition_duration_sec=30 "
+                "WHERE transition_duration_sec > 30"
+            )
+        )
+
+        schedule_cols = conn.execute(text("PRAGMA table_info(schedule)")).fetchall()
+        schedule_col_names = {row[1] for row in schedule_cols}
+        if "note" not in schedule_col_names:
+            conn.execute(text("ALTER TABLE schedule ADD COLUMN note VARCHAR"))
+        if "countdown_sec" not in schedule_col_names:
+            conn.execute(text("ALTER TABLE schedule ADD COLUMN countdown_sec INTEGER"))
+        conn.execute(
+            text(
+                "UPDATE schedule SET countdown_sec=NULL "
+                "WHERE countdown_sec IS NOT NULL AND countdown_sec <= 0"
+            )
+        )
+
+        playlist_cols = conn.execute(text("PRAGMA table_info(playlist)")).fetchall()
+        playlist_col_names = {row[1] for row in playlist_cols}
+        if "is_flash_sale" not in playlist_col_names:
+            conn.execute(
+                text("ALTER TABLE playlist ADD COLUMN is_flash_sale INTEGER DEFAULT 0")
+            )
+        if "flash_note" not in playlist_col_names:
+            conn.execute(text("ALTER TABLE playlist ADD COLUMN flash_note VARCHAR"))
+        if "flash_countdown_sec" not in playlist_col_names:
+            conn.execute(
+                text("ALTER TABLE playlist ADD COLUMN flash_countdown_sec INTEGER")
+            )
+        if "flash_items_json" not in playlist_col_names:
+            conn.execute(text("ALTER TABLE playlist ADD COLUMN flash_items_json VARCHAR"))
+        conn.execute(
+            text(
+                "UPDATE playlist SET is_flash_sale=0 "
+                "WHERE is_flash_sale IS NULL"
+            )
+        )
+        conn.execute(
+            text(
+                "UPDATE playlist SET flash_countdown_sec=NULL "
+                "WHERE flash_countdown_sec IS NOT NULL AND flash_countdown_sec <= 0"
             )
         )

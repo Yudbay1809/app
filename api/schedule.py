@@ -46,12 +46,37 @@ def _validate_no_overlap(
         raise HTTPException(status_code=400, detail="Schedule overlaps with an existing entry.")
 
 
+def _normalize_countdown(countdown_sec: int | None) -> int | None:
+    if countdown_sec is None:
+        return None
+    if countdown_sec <= 0:
+        return None
+    return countdown_sec
+
+
 @router.post("")
-def create_schedule(screen_id: str, playlist_id: str, day_of_week: int, start_time: str, end_time: str, db: Session = Depends(get_db)):
+def create_schedule(
+    screen_id: str,
+    playlist_id: str,
+    day_of_week: int,
+    start_time: str,
+    end_time: str,
+    note: str | None = None,
+    countdown_sec: int | None = None,
+    db: Session = Depends(get_db),
+):
     start = _parse_time(start_time)
     end = _parse_time(end_time)
     _validate_no_overlap(db, screen_id, day_of_week, start, end)
-    schedule = Schedule(screen_id=screen_id, playlist_id=playlist_id, day_of_week=day_of_week, start_time=start, end_time=end)
+    schedule = Schedule(
+        screen_id=screen_id,
+        playlist_id=playlist_id,
+        day_of_week=day_of_week,
+        start_time=start,
+        end_time=end,
+        note=(note or "").strip() or None,
+        countdown_sec=_normalize_countdown(countdown_sec),
+    )
     db.add(schedule)
     db.commit()
     db.refresh(schedule)
@@ -62,7 +87,16 @@ def list_schedules(screen_id: str, db: Session = Depends(get_db)):
     return db.query(Schedule).filter(Schedule.screen_id == screen_id).all()
 
 @router.put("/{schedule_id}")
-def update_schedule(schedule_id: str, day_of_week: int | None = None, start_time: str | None = None, end_time: str | None = None, playlist_id: str | None = None, db: Session = Depends(get_db)):
+def update_schedule(
+    schedule_id: str,
+    day_of_week: int | None = None,
+    start_time: str | None = None,
+    end_time: str | None = None,
+    playlist_id: str | None = None,
+    note: str | None = None,
+    countdown_sec: int | None = None,
+    db: Session = Depends(get_db),
+):
     schedule = db.query(Schedule).get(schedule_id)
     if not schedule:
         raise HTTPException(status_code=404, detail="Schedule not found")
@@ -77,6 +111,10 @@ def update_schedule(schedule_id: str, day_of_week: int | None = None, start_time
     schedule.end_time = new_end
     if playlist_id is not None:
         schedule.playlist_id = playlist_id
+    if note is not None:
+        schedule.note = note.strip() or None
+    if countdown_sec is not None:
+        schedule.countdown_sec = _normalize_countdown(countdown_sec)
     db.commit()
     db.refresh(schedule)
     return schedule

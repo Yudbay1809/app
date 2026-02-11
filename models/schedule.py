@@ -10,3 +10,5 @@ class Schedule(Base):
     day_of_week = Column(Integer, nullable=False)
     start_time = Column(Time, nullable=False)
     end_time = Column(Time, nullable=False)
+    note = Column(String, nullable=True)
+    countdown_sec = Column(Integer, nullable=True)

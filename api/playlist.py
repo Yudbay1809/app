@@ -1,7 +1,10 @@
+import json
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from app.db import SessionLocal
 from app.models.playlist import Playlist, PlaylistItem
+from app.models.media import Media
 from app.models.schedule import Schedule
 from app.models.screen import Screen
 
@@ -14,9 +17,83 @@ def get_db():
     finally:
         db.close()
 
+
+def _normalize_countdown(value: int | None) -> int | None:
+    if value is None:
+        return None
+    if value <= 0:
+        return None
+    return value
+
+
+def _normalize_flash_items_json(
+    value: str | None,
+    db: Session,
+) -> str | None:
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    try:
+        decoded = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid flash_items_json: {exc.msg}") from exc
+    if not isinstance(decoded, list):
+        raise HTTPException(status_code=400, detail="flash_items_json must be a JSON array")
+
+    normalized_rows: list[dict[str, str]] = []
+    media_ids: set[str] = set()
+    for index, row in enumerate(decoded):
+        if not isinstance(row, dict):
+            raise HTTPException(status_code=400, detail=f"flash_items_json[{index}] must be an object")
+        normalized = {
+            "name": str(row.get("name", "")).strip(),
+            "brand": str(row.get("brand", "")).strip(),
+            "normal_price": str(row.get("normal_price", "")).strip(),
+            "promo_price": str(row.get("promo_price", "")).strip(),
+            "stock": str(row.get("stock", "")).strip(),
+            "media_id": str(row.get("media_id", "")).strip(),
+        }
+        if not normalized["name"]:
+            continue
+        if not normalized["media_id"]:
+            raise HTTPException(
+                status_code=400,
+                detail=f"flash_items_json[{index}].media_id is required when name is set",
+            )
+        normalized_rows.append(normalized)
+        media_ids.add(normalized["media_id"])
+
+    if media_ids:
+        found = {
+            row[0]
+            for row in db.query(Media.id).filter(Media.id.in_(list(media_ids))).all()
+        }
+        missing = sorted(media_ids - found)
+        if missing:
+            raise HTTPException(
+                status_code=400,
+                detail=f"flash_items_json contains unknown media_id: {', '.join(missing)}",
+            )
+    return json.dumps(normalized_rows, separators=(",", ":"))
+
 @router.post("")
-def create_playlist(screen_id: str, name: str, db: Session = Depends(get_db)):
-    playlist = Playlist(screen_id=screen_id, name=name)
+def create_playlist(
+    screen_id: str,
+    name: str,
+    is_flash_sale: bool = False,
+    flash_note: str | None = None,
+    flash_countdown_sec: int | None = None,
+    flash_items_json: str | None = None,
+    db: Session = Depends(get_db),
+):
+    playlist = Playlist(
+        screen_id=screen_id,
+        name=name,
+        is_flash_sale=is_flash_sale,
+        flash_note=(flash_note or "").strip() or None,
+        flash_countdown_sec=_normalize_countdown(flash_countdown_sec),
+        flash_items_json=_normalize_flash_items_json(flash_items_json, db),
+    )
     db.add(playlist)
     db.commit()
     db.refresh(playlist)
@@ -27,11 +104,31 @@ def list_playlists(screen_id: str, db: Session = Depends(get_db)):
     return db.query(Playlist).filter(Playlist.screen_id == screen_id).all()
 
 @router.put("/{playlist_id}")
-def update_playlist(playlist_id: str, name: str, db: Session = Depends(get_db)):
+def update_playlist(
+    playlist_id: str,
+    name: str | None = None,
+    is_flash_sale: bool | None = None,
+    flash_note: str | None = None,
+    flash_countdown_sec: int | None = None,
+    flash_items_json: str | None = None,
+    db: Session = Depends(get_db),
+):
     playlist = db.query(Playlist).get(playlist_id)
     if not playlist:
         raise HTTPException(status_code=404, detail="Playlist not found")
-    playlist.name = name
+    if name is not None:
+        cleaned = name.strip()
+        if not cleaned:
+            raise HTTPException(status_code=400, detail="Playlist name cannot be empty")
+        playlist.name = cleaned
+    if is_flash_sale is not None:
+        playlist.is_flash_sale = is_flash_sale
+    if flash_note is not None:
+        playlist.flash_note = flash_note.strip() or None
+    if flash_countdown_sec is not None:
+        playlist.flash_countdown_sec = _normalize_countdown(flash_countdown_sec)
+    if flash_items_json is not None:
+        playlist.flash_items_json = _normalize_flash_items_json(flash_items_json, db)
     db.commit()
     db.refresh(playlist)
     return playlist

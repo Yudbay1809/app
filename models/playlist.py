@@ -7,6 +7,10 @@ class Playlist(Base):
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     screen_id = Column(String(36), ForeignKey("screen.id"), nullable=False)
     name = Column(String, nullable=False)
+    is_flash_sale = Column(Boolean, nullable=False, default=False)
+    flash_note = Column(String, nullable=True)
+    flash_countdown_sec = Column(Integer, nullable=True)
+    flash_items_json = Column(String, nullable=True)
 
 class PlaylistItem(Base):
     __tablename__ = "playlist_item"
