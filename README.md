@@ -7,6 +7,11 @@
 
 FastAPI backend for digital signage operations: media catalog, playlists, schedules, device registration, Flash Sale campaign, and realtime config updates.
 
+## Final Release Notes
+- Media upload path is normalized to URL-safe format (`/storage/media/<file>`), so clients no longer receive Windows backslash paths.
+- Server IP selection on Windows prioritizes adapter with Default Gateway to improve `GET /healthz` and `GET /server-info` accuracy.
+- Validated with end-to-end API + websocket smoke tests before release.
+
 ## Features
 - Device provisioning with ownership guard
 - Media upload/catalog with checksum and pagination
@@ -16,6 +21,11 @@ FastAPI backend for digital signage operations: media catalog, playlists, schedu
 - Device-level Flash Sale campaign (independent from playlist)
 - Realtime update broadcast over WebSocket
 - Health and server discovery endpoints
+
+## Deployment Notes (Current Production Style)
+- App process is managed by PM2 (`ecosystem.config.js` / `ecosystem.staging.config.js`).
+- SQLite database is file-based (`signage.db`) and is not managed as a separate PM2 process.
+- Recommended runtime for current setup: single PM2 instance per environment.
 
 ## Stack
 - FastAPI
@@ -40,6 +50,13 @@ cd "D:\APP Video Promosi"
 .\app\.venv\Scripts\python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
+Run with PM2:
+```bash
+cd "D:\APP Video Promosi"
+pm2 start ecosystem.config.js
+pm2 logs signage-api
+```
+
 Open docs:
 - `http://127.0.0.1:8000/docs`
 - `http://127.0.0.1:8000/redoc`
@@ -57,6 +74,13 @@ Open docs:
 - `PUT /screens/{screen_id}?grid_preset=2x2&transition_duration_sec=2`
 - `GET /media/page`
 - `WS /ws/updates`
+
+## Manual Smoke Test Checklist
+1. `GET /healthz` returns `200`.
+2. Register device and fetch `GET /devices/{device_id}/config`.
+3. Upload media and verify `media.path` starts with `/storage/media/`.
+4. Publish Flash Sale now and verify config reflects `flash_sale`.
+5. Confirm websocket receives `config_changed` after mutation endpoints.
 
 ## Screen Transition Duration
 - Field: `transition_duration_sec` (seconds)
