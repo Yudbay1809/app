@@ -2,6 +2,8 @@ import os
 import socket
 import asyncio
 import logging
+import subprocess
+import re
 from datetime import datetime, timezone
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -38,33 +40,57 @@ if QUIET_WEBSOCKET_LOG:
 
 
 def _local_ipv4_addresses() -> list[str]:
-    candidates: set[str] = set()
+    candidates: list[str] = []
+
+    def add_candidate(ip: str) -> None:
+        if ip and ip != "127.0.0.1" and ip not in candidates:
+            candidates.append(ip)
+
     try:
         host = socket.gethostname()
         for entry in socket.getaddrinfo(host, None, family=socket.AF_INET):
-            ip = entry[4][0]
-            if ip and ip != "127.0.0.1":
-                candidates.add(ip)
+            add_candidate(entry[4][0])
     except Exception:
         pass
 
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             sock.connect(("8.8.8.8", 80))
-            ip = sock.getsockname()[0]
-            if ip and ip != "127.0.0.1":
-                candidates.add(ip)
+            add_candidate(sock.getsockname()[0])
     except Exception:
         pass
 
-    return sorted(candidates)
+    return candidates
 
 
 def _is_private_ip(ip: str) -> bool:
     return ip.startswith("10.") or ip.startswith("192.168.") or ip.startswith("172.")
 
 
+def _ip_from_default_gateway_adapter() -> str | None:
+    # On Windows, pick the IPv4 from the adapter section that has Default Gateway.
+    try:
+        output = subprocess.check_output(["ipconfig"], text=True, encoding="utf-8", errors="ignore")
+    except Exception:
+        return None
+
+    blocks = re.split(r"\r?\n\r?\n", output)
+    for block in blocks:
+        ipv4_match = re.search(r"IPv4 Address[^\n:]*:\s*([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)", block)
+        gw_match = re.search(r"Default Gateway[^\n:]*:\s*([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)", block)
+        if not ipv4_match or not gw_match:
+            continue
+        ip = ipv4_match.group(1)
+        if _is_private_ip(ip):
+            return ip
+    return None
+
+
 def _primary_ip() -> str:
+    gw_ip = _ip_from_default_gateway_adapter()
+    if gw_ip:
+        return gw_ip
+
     ips = _local_ipv4_addresses()
     for ip in ips:
         if _is_private_ip(ip):

@@ -11,7 +11,8 @@ def save_file(file: UploadFile) -> tuple[str, int, str]:
     ensure_storage()
     content = file.file.read()
     checksum = hashlib.sha256(content).hexdigest()
-    path = os.path.join(MEDIA_DIR, file.filename)
+    filename = os.path.basename((file.filename or "upload.bin").strip()) or "upload.bin"
+    path = os.path.join(MEDIA_DIR, filename)
     with open(path, "wb") as f:
         f.write(content)
-    return path, len(content), checksum
+    return path.replace("\\", "/"), len(content), checksum
