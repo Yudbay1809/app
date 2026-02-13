@@ -26,6 +26,15 @@ def _normalize_countdown(value: int | None) -> int | None:
     return value
 
 
+def _normalize_entity_id(value: str, field_name: str) -> str:
+    normalized = (value or "").strip()
+    if normalized.startswith("{") and normalized.endswith("}"):
+        normalized = normalized[1:-1].strip()
+    if not normalized:
+        raise HTTPException(status_code=400, detail=f"{field_name} is required")
+    return normalized
+
+
 def _normalize_flash_items_json(
     value: str | None,
     db: Session,
@@ -86,6 +95,7 @@ def create_playlist(
     flash_items_json: str | None = None,
     db: Session = Depends(get_db),
 ):
+    screen_id = _normalize_entity_id(screen_id, "screen_id")
     playlist = Playlist(
         screen_id=screen_id,
         name=name,
@@ -101,6 +111,7 @@ def create_playlist(
 
 @router.get("")
 def list_playlists(screen_id: str, db: Session = Depends(get_db)):
+    screen_id = _normalize_entity_id(screen_id, "screen_id")
     return db.query(Playlist).filter(Playlist.screen_id == screen_id).all()
 
 @router.put("/{playlist_id}")
@@ -113,6 +124,7 @@ def update_playlist(
     flash_items_json: str | None = None,
     db: Session = Depends(get_db),
 ):
+    playlist_id = _normalize_entity_id(playlist_id, "playlist_id")
     playlist = db.query(Playlist).get(playlist_id)
     if not playlist:
         raise HTTPException(status_code=404, detail="Playlist not found")
@@ -135,6 +147,7 @@ def update_playlist(
 
 @router.delete("/{playlist_id}")
 def delete_playlist(playlist_id: str, db: Session = Depends(get_db)):
+    playlist_id = _normalize_entity_id(playlist_id, "playlist_id")
     playlist = db.query(Playlist).get(playlist_id)
     if not playlist:
         raise HTTPException(status_code=404, detail="Playlist not found")
@@ -150,6 +163,8 @@ def delete_playlist(playlist_id: str, db: Session = Depends(get_db)):
 
 @router.post("/{playlist_id}/items")
 def add_item(playlist_id: str, media_id: str, order: int, duration_sec: int | None = None, enabled: bool = True, db: Session = Depends(get_db)):
+    playlist_id = _normalize_entity_id(playlist_id, "playlist_id")
+    media_id = _normalize_entity_id(media_id, "media_id")
     item = PlaylistItem(playlist_id=playlist_id, media_id=media_id, order=order, duration_sec=duration_sec, enabled=enabled)
     db.add(item)
     db.commit()
@@ -158,6 +173,7 @@ def add_item(playlist_id: str, media_id: str, order: int, duration_sec: int | No
 
 @router.get("/{playlist_id}/items")
 def list_items(playlist_id: str, db: Session = Depends(get_db)):
+    playlist_id = _normalize_entity_id(playlist_id, "playlist_id")
     playlist = db.query(Playlist).get(playlist_id)
     if not playlist:
         raise HTTPException(status_code=404, detail="Playlist not found")
@@ -170,6 +186,7 @@ def list_items(playlist_id: str, db: Session = Depends(get_db)):
 
 @router.put("/items/{item_id}")
 def update_item(item_id: str, order: int | None = None, duration_sec: int | None = None, enabled: bool | None = None, db: Session = Depends(get_db)):
+    item_id = _normalize_entity_id(item_id, "item_id")
     item = db.query(PlaylistItem).get(item_id)
     if not item:
         raise HTTPException(status_code=404, detail="Playlist item not found")
@@ -185,6 +202,7 @@ def update_item(item_id: str, order: int | None = None, duration_sec: int | None
 
 @router.delete("/items/{item_id}")
 def delete_item(item_id: str, db: Session = Depends(get_db)):
+    item_id = _normalize_entity_id(item_id, "item_id")
     item = db.query(PlaylistItem).get(item_id)
     if not item:
         raise HTTPException(status_code=404, detail="Playlist item not found")

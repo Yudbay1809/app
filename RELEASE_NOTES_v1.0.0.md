@@ -22,3 +22,16 @@ This release stabilizes the core signage workflow across media, playlist, schedu
 
 ## Known Constraints
 - Push to GitHub from this execution environment may fail due outbound network restrictions.
+
+---
+
+## Patch Update (2026-02-13)
+
+### Bug Fix
+- Fixed intermittent failure on `PUT /playlists/{playlist_id}` where certain client-formatted IDs could return `Playlist not found`.
+- Backend now normalizes entity IDs (`trim` and `{uuid}` wrapper compatibility) before DB lookup.
+
+### Runtime Validation
+- PM2 service health: online and stable.
+- Visual flash-sale validation (60s ON -> OFF) succeeded on live online device.
+- WebSocket realtime update stream (`/ws/updates`) confirmed to publish `config_changed` on config mutations.

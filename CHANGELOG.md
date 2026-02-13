@@ -2,6 +2,15 @@
 
 All notable changes to this project are documented in this file.
 
+## [1.0.1] - 2026-02-13
+
+### Fixed
+- Hardened playlist ID handling in `api/playlist.py` by normalizing incoming IDs (trim + `{uuid}` compatibility) to prevent intermittent `Playlist not found` during `PUT /playlists/{playlist_id}` calls from some clients.
+
+### Verified
+- Visual flash-sale runtime test on live device (`Device-0005`) with 60-second activation and reset completed successfully.
+- Realtime websocket sync (`/ws/updates`) emits `config_changed` on mutation and was validated live.
+
 ## [1.0.0] - 2026-02-10
 
 ### Added
