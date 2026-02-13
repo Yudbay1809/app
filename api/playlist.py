@@ -85,6 +85,26 @@ def _normalize_flash_items_json(
             )
     return json.dumps(normalized_rows, separators=(",", ":"))
 
+
+def _normalize_media_type(value: str | None) -> str:
+    media_type = (value or "").strip().lower()
+    if media_type in {"image", "video"}:
+        return media_type
+    return media_type
+
+
+def _playlist_media_type(db: Session, playlist_id: str) -> str | None:
+    row = (
+        db.query(Media.type)
+        .join(PlaylistItem, PlaylistItem.media_id == Media.id)
+        .filter(PlaylistItem.playlist_id == playlist_id)
+        .order_by(PlaylistItem.order.asc(), PlaylistItem.id.asc())
+        .first()
+    )
+    if not row:
+        return None
+    return _normalize_media_type(row[0])
+
 @router.post("")
 def create_playlist(
     screen_id: str,
@@ -165,6 +185,24 @@ def delete_playlist(playlist_id: str, db: Session = Depends(get_db)):
 def add_item(playlist_id: str, media_id: str, order: int, duration_sec: int | None = None, enabled: bool = True, db: Session = Depends(get_db)):
     playlist_id = _normalize_entity_id(playlist_id, "playlist_id")
     media_id = _normalize_entity_id(media_id, "media_id")
+    playlist = db.query(Playlist).get(playlist_id)
+    if not playlist:
+        raise HTTPException(status_code=404, detail="Playlist not found")
+    media = db.query(Media).get(media_id)
+    if not media:
+        raise HTTPException(status_code=404, detail="Media not found")
+
+    incoming_type = _normalize_media_type(media.type)
+    existing_type = _playlist_media_type(db, playlist_id)
+    if existing_type and incoming_type and existing_type != incoming_type:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Playlist tidak boleh campur foto dan video. "
+                f"Playlist ini bertipe {existing_type}, media yang dipilih bertipe {incoming_type}."
+            ),
+        )
+
     item = PlaylistItem(playlist_id=playlist_id, media_id=media_id, order=order, duration_sec=duration_sec, enabled=enabled)
     db.add(item)
     db.commit()

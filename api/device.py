@@ -414,6 +414,31 @@ def device_config(device_id: str, request: Request, account_id: str | None = Non
             for it in items:
                 media_ids.add(it.media_id)
 
+    # Allow central/shared playlists to be referenced by active_playlist_id or schedule.playlist_id
+    # even when the playlist belongs to a different screen/device.
+    known_playlist_ids = {str(pl.id) for pl in playlists}
+    referenced_playlist_ids: set[str] = set()
+    for screen in screens:
+        active_id = str(screen.active_playlist_id or "").strip()
+        if active_id:
+            referenced_playlist_ids.add(active_id)
+    for sc in schedules:
+        pid = str(sc.playlist_id or "").strip()
+        if pid:
+            referenced_playlist_ids.add(pid)
+
+    missing_referenced_ids = [
+        pid for pid in referenced_playlist_ids if pid not in known_playlist_ids
+    ]
+    if missing_referenced_ids:
+        referenced_playlists = db.query(Playlist).filter(Playlist.id.in_(missing_referenced_ids)).all()
+        playlists.extend(referenced_playlists)
+        for pl in referenced_playlists:
+            items = db.query(PlaylistItem).filter(PlaylistItem.playlist_id == pl.id).all()
+            playlist_items.extend(items)
+            for it in items:
+                media_ids.add(it.media_id)
+
     media = []
     flash_sale_runtime = None
     flash_sale_config = db.query(FlashSaleConfig).filter(FlashSaleConfig.device_id == device.id).first()
