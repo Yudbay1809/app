@@ -33,9 +33,15 @@ def upload_media(
     duration_sec: int = 10,
     db: Session = Depends(get_db)
 ):
+    normalized_type = (type or "").strip().lower()
+    if normalized_type not in {"image", "video"}:
+        raise HTTPException(status_code=422, detail="Tipe media tidak didukung. Gunakan image atau video.")
     media_name = _resolved_media_name(name, file)
-    path, size, checksum = save_file(file)
-    media = Media(name=media_name, type=type, path=f"/{path}", duration_sec=duration_sec, size=size, checksum=checksum)
+    try:
+        path, size, checksum = save_file(file, declared_type=normalized_type)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    media = Media(name=media_name, type=normalized_type, path=f"/{path}", duration_sec=duration_sec, size=size, checksum=checksum)
     db.add(media)
     db.commit()
     db.refresh(media)
@@ -56,9 +62,16 @@ def upload_media_to_playlist(
     if not playlist:
         raise HTTPException(status_code=404, detail="Playlist not found")
 
+    normalized_type = (type or "").strip().lower()
+    if normalized_type not in {"image", "video"}:
+        raise HTTPException(status_code=422, detail="Tipe media tidak didukung. Gunakan image atau video.")
+
     media_name = _resolved_media_name(name, file)
-    path, size, checksum = save_file(file)
-    media = Media(name=media_name, type=type, path=f"/{path}", duration_sec=duration_sec, size=size, checksum=checksum)
+    try:
+        path, size, checksum = save_file(file, declared_type=normalized_type)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    media = Media(name=media_name, type=normalized_type, path=f"/{path}", duration_sec=duration_sec, size=size, checksum=checksum)
     db.add(media)
     db.commit()
     db.refresh(media)
@@ -73,7 +86,7 @@ def upload_media_to_playlist(
         playlist_id=playlist_id,
         media_id=media.id,
         order=next_order,
-        duration_sec=duration_sec if type == "image" else None,
+        duration_sec=duration_sec if normalized_type == "image" else None,
         enabled=enabled,
     )
     db.add(item)

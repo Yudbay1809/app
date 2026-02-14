@@ -12,7 +12,13 @@ FastAPI backend for digital signage operations: media catalog, playlists, schedu
 - Server IP selection on Windows prioritizes adapter with Default Gateway to improve `GET /healthz` and `GET /server-info` accuracy.
 - Validated with end-to-end API + websocket smoke tests before release.
 
-## Latest Updates (2026-02-13)
+## Latest Updates (2026-02-14)
+- Upload validation hardened:
+  - allowed type only `image` or `video`
+  - extension whitelist enforced
+  - max size guard (env-configurable) to prevent oversized media ingestion
+  - empty file upload rejected
+- `GET /devices/{id}/config` media payload now includes `size` for client-side playback guard.
 - Device config now supports central playlist references: `GET /devices/{id}/config` includes playlists referenced by `active_playlist_id` and schedule even across other screens/devices.
 - Playlist media type is now enforced as single-type per playlist (photo-only or video-only). Mixed media insertion is rejected at API level.
 

@@ -522,6 +522,7 @@ def device_config(device_id: str, request: Request, account_id: str | None = Non
                 "path": m.path,
                 "checksum": m.checksum,
                 "duration_sec": m.duration_sec,
+                "size": m.size,
             }
             for m in media
         ],
