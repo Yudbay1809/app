@@ -2,6 +2,22 @@
 
 All notable changes to this project are documented in this file.
 
+## [1.0.2] - 2026-02-14
+
+### Added
+- Added media file size in device config payload (`GET /devices/{device_id}/config` -> `media[].size`) to support client-side media guard.
+
+### Changed
+- Hardened media upload validation:
+  - only `image`/`video` media type accepted
+  - extension whitelist enforced per media type
+  - max size guard enforced (env-configurable)
+  - empty upload rejected
+- Normalized upload flow to reject invalid media early with HTTP 422.
+
+### Ops
+- Updated README with latest validation behavior and payload contract notes.
+
 ## [1.0.1] - 2026-02-13
 
 ### Fixed
