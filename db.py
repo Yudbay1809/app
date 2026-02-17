@@ -33,6 +33,10 @@ def ensure_sqlite_schema():
             conn.execute(text("ALTER TABLE device ADD COLUMN legacy_id VARCHAR"))
         if "client_ip" not in col_names:
             conn.execute(text("ALTER TABLE device ADD COLUMN client_ip VARCHAR"))
+        if "cached_media_ids" not in col_names:
+            conn.execute(text("ALTER TABLE device ADD COLUMN cached_media_ids TEXT"))
+        if "media_cache_updated_at" not in col_names:
+            conn.execute(text("ALTER TABLE device ADD COLUMN media_cache_updated_at DATETIME"))
         duplicate_ip_rows = conn.execute(
             text(
                 "SELECT id, client_ip FROM device "

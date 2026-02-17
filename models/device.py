@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime
-from sqlalchemy import Column, String, DateTime
+from sqlalchemy import Column, String, DateTime, Text
 from app.db import Base
 
 class Device(Base):
@@ -14,3 +14,5 @@ class Device(Base):
     last_seen = Column(DateTime)
     status = Column(String, default="offline")
     orientation = Column(String, default="portrait")
+    cached_media_ids = Column(Text, nullable=True)
+    media_cache_updated_at = Column(DateTime, nullable=True)

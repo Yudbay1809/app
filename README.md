@@ -12,7 +12,13 @@ FastAPI backend for digital signage operations: media catalog, playlists, schedu
 - Server IP selection on Windows prioritizes adapter with Default Gateway to improve `GET /healthz` and `GET /server-info` accuracy.
 - Validated with end-to-end API + websocket smoke tests before release.
 
-## Latest Updates (2026-02-14)
+## Latest Updates (2026-02-17)
+- Device media cache tracking added:
+  - `POST /devices/{device_id}/media-cache-report`
+  - `GET /devices/{device_id}/media-cache-status`
+- Device table now stores `cached_media_ids` and `media_cache_updated_at`.
+- `media-cache-status` computes required media from active/scheduled playlists + Flash Sale products and returns `ready/missing`.
+- Existing upload validation, media-size payload, and playlist type guard remain active.
 - Upload validation hardened:
   - allowed type only `image` or `video`
   - extension whitelist enforced
@@ -77,6 +83,8 @@ Open docs:
 - `POST /devices/register`
 - `POST /devices/{device_id}/heartbeat`
 - `GET /devices/{device_id}/config`
+- `POST /devices/{device_id}/media-cache-report`
+- `GET /devices/{device_id}/media-cache-status`
 - `PUT /flash-sale/device/{device_id}/now`
 - `PUT /flash-sale/device/{device_id}/schedule`
 - `DELETE /flash-sale/device/{device_id}`

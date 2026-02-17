@@ -103,6 +103,86 @@ def _parse_hms(value: str) -> tuple[int, int, int] | None:
     return hour, minute, second
 
 
+def _normalize_media_id_set(values: list[str] | None) -> list[str]:
+    if not values:
+        return []
+    normalized: set[str] = set()
+    for item in values:
+        value = str(item or "").strip()
+        if value:
+            normalized.add(value)
+    return sorted(normalized)
+
+
+def _parse_cached_media_ids(csv: str | None) -> set[str]:
+    output: set[str] = set()
+    for item in (csv or "").split(","):
+        value = item.strip()
+        if value:
+            output.add(value)
+    return output
+
+
+def _collect_required_media_ids(db: Session, device: Device) -> set[str]:
+    screens = db.query(Screen).filter(Screen.device_id == device.id).all()
+    schedules = []
+    playlists = []
+    playlist_items = []
+    media_ids: set[str] = set()
+
+    for screen in screens:
+        screen_schedules = db.query(Schedule).filter(Schedule.screen_id == screen.id).all()
+        schedules.extend(screen_schedules)
+
+        screen_playlists = db.query(Playlist).filter(Playlist.screen_id == screen.id).all()
+        playlists.extend(screen_playlists)
+
+        for pl in screen_playlists:
+            items = db.query(PlaylistItem).filter(PlaylistItem.playlist_id == pl.id).all()
+            playlist_items.extend(items)
+            for it in items:
+                media_ids.add(str(it.media_id))
+
+    known_playlist_ids = {str(pl.id) for pl in playlists}
+    referenced_playlist_ids: set[str] = set()
+    for screen in screens:
+        active_id = str(screen.active_playlist_id or "").strip()
+        if active_id:
+            referenced_playlist_ids.add(active_id)
+    for sc in schedules:
+        pid = str(sc.playlist_id or "").strip()
+        if pid:
+            referenced_playlist_ids.add(pid)
+
+    missing_referenced_ids = [
+        pid for pid in referenced_playlist_ids if pid not in known_playlist_ids
+    ]
+    if missing_referenced_ids:
+        referenced_playlists = db.query(Playlist).filter(Playlist.id.in_(missing_referenced_ids)).all()
+        for pl in referenced_playlists:
+            items = db.query(PlaylistItem).filter(PlaylistItem.playlist_id == pl.id).all()
+            playlist_items.extend(items)
+            for it in items:
+                media_ids.add(str(it.media_id))
+
+    flash_sale_config = db.query(FlashSaleConfig).filter(FlashSaleConfig.device_id == device.id).first()
+    flash_sale_runtime = _resolve_flash_sale_runtime(flash_sale_config, datetime.utcnow())
+    if flash_sale_runtime and flash_sale_runtime.get("products_json"):
+        try:
+            rows = json.loads(flash_sale_runtime["products_json"])
+            if isinstance(rows, list):
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    media_id = str(row.get("media_id", "")).strip()
+                    if media_id:
+                        media_ids.add(media_id)
+        except Exception:
+            pass
+
+    return media_ids
+
+
 def _resolve_flash_sale_runtime(config: FlashSaleConfig | None, now: datetime) -> dict | None:
     if not config:
         return None
@@ -171,6 +251,62 @@ def _resolve_flash_sale_runtime(config: FlashSaleConfig | None, now: datetime) -
         "countdown_end_at": countdown_end.isoformat() if countdown_end else None,
         "activated_at": config.activated_at.isoformat() if config.activated_at else None,
         "updated_at": config.updated_at.isoformat() if config.updated_at else None,
+    }
+
+
+@router.post("/{device_id}/media-cache-report")
+def media_cache_report(
+    device_id: str,
+    request: Request,
+    media_ids: list[str] = Body(default=[]),
+    account_id: str | None = None,
+    db: Session = Depends(get_db),
+):
+    device = _find_device(db, device_id)
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+    _enforce_device_owner(device, _resolve_account_id(request, account_id))
+
+    normalized = _normalize_media_id_set(media_ids)
+    device.cached_media_ids = ",".join(normalized)
+    device.media_cache_updated_at = datetime.utcnow()
+    db.commit()
+
+    return {
+        "ok": True,
+        "device_id": str(device.id),
+        "cached_count": len(normalized),
+        "updated_at": device.media_cache_updated_at.isoformat() if device.media_cache_updated_at else None,
+    }
+
+
+@router.get("/{device_id}/media-cache-status")
+def media_cache_status(
+    device_id: str,
+    request: Request,
+    account_id: str | None = None,
+    db: Session = Depends(get_db),
+):
+    device = _find_device(db, device_id)
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+    _enforce_device_owner(device, _resolve_account_id(request, account_id))
+
+    required_ids = _collect_required_media_ids(db, device)
+    cached_ids = _parse_cached_media_ids(device.cached_media_ids)
+    missing_ids = sorted(required_ids - cached_ids)
+    extra_ids = sorted(cached_ids - required_ids)
+
+    return {
+        "device_id": str(device.id),
+        "required_count": len(required_ids),
+        "cached_count": len(cached_ids),
+        "missing_count": len(missing_ids),
+        "ready": len(missing_ids) == 0,
+        "required_media_ids": sorted(required_ids),
+        "missing_media_ids": missing_ids,
+        "extra_cached_media_ids": extra_ids,
+        "cache_updated_at": device.media_cache_updated_at.isoformat() if device.media_cache_updated_at else None,
     }
 
 
