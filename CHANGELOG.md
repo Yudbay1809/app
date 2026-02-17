@@ -2,6 +2,21 @@
 
 All notable changes to this project are documented in this file.
 
+## [1.0.3] - 2026-02-17
+
+### Added
+- Added device media cache telemetry endpoint:
+  - `POST /devices/{device_id}/media-cache-report`
+- Added device media cache status endpoint:
+  - `GET /devices/{device_id}/media-cache-status`
+- Added device schema fields for cache tracking:
+  - `cached_media_ids`
+  - `media_cache_updated_at`
+
+### Changed
+- `media-cache-status` now computes required media from active/scheduled playlists and Flash Sale products, then returns `ready`, `missing_count`, and `missing_media_ids`.
+- Updated README to document new media cache endpoints and payload behavior.
+
 ## [1.0.2] - 2026-02-14
 
 ### Added
