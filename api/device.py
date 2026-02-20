@@ -123,6 +123,48 @@ def _parse_cached_media_ids(csv: str | None) -> set[str]:
     return output
 
 
+def _download_status_presentation(download_status: str) -> tuple[str, str]:
+    mapping = {
+        "completed": ("Selesai", "#16A34A"),
+        "in_progress": ("Sedang Download", "#F59E0B"),
+        "not_reported": ("Belum Lapor", "#6B7280"),
+        "no_content": ("Tidak Ada Konten", "#2563EB"),
+    }
+    return mapping.get(download_status, ("Unknown", "#6B7280"))
+
+
+def _compute_media_cache_status(db: Session, device: Device) -> dict:
+    required_ids = _collect_required_media_ids(db, device)
+    cached_ids = _parse_cached_media_ids(device.cached_media_ids)
+    missing_ids = sorted(required_ids - cached_ids)
+    extra_ids = sorted(cached_ids - required_ids)
+    has_report = device.media_cache_updated_at is not None
+
+    if len(required_ids) == 0:
+        download_status = "no_content"
+    elif not has_report:
+        download_status = "not_reported"
+    elif len(missing_ids) == 0:
+        download_status = "completed"
+    else:
+        download_status = "in_progress"
+    status_label, status_color = _download_status_presentation(download_status)
+
+    return {
+        "required_count": len(required_ids),
+        "cached_count": len(cached_ids),
+        "missing_count": len(missing_ids),
+        "ready": len(missing_ids) == 0,
+        "download_status": download_status,
+        "download_status_label": status_label,
+        "download_status_color": status_color,
+        "required_media_ids": sorted(required_ids),
+        "missing_media_ids": missing_ids,
+        "extra_cached_media_ids": extra_ids,
+        "cache_updated_at": device.media_cache_updated_at.isoformat() if device.media_cache_updated_at else None,
+    }
+
+
 def _collect_required_media_ids(db: Session, device: Device) -> set[str]:
     screens = db.query(Screen).filter(Screen.device_id == device.id).all()
     schedules = []
@@ -291,22 +333,26 @@ def media_cache_status(
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
     _enforce_device_owner(device, _resolve_account_id(request, account_id))
+    return {"device_id": str(device.id), **_compute_media_cache_status(db, device)}
 
-    required_ids = _collect_required_media_ids(db, device)
-    cached_ids = _parse_cached_media_ids(device.cached_media_ids)
-    missing_ids = sorted(required_ids - cached_ids)
-    extra_ids = sorted(cached_ids - required_ids)
+
+@router.post("/{device_id}/request-media-download")
+def request_media_download(
+    device_id: str,
+    request: Request,
+    account_id: str | None = None,
+    db: Session = Depends(get_db),
+):
+    device = _find_device(db, device_id)
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+    _enforce_device_owner(device, _resolve_account_id(request, account_id))
 
     return {
+        "ok": True,
         "device_id": str(device.id),
-        "required_count": len(required_ids),
-        "cached_count": len(cached_ids),
-        "missing_count": len(missing_ids),
-        "ready": len(missing_ids) == 0,
-        "required_media_ids": sorted(required_ids),
-        "missing_media_ids": missing_ids,
-        "extra_cached_media_ids": extra_ids,
-        "cache_updated_at": device.media_cache_updated_at.isoformat() if device.media_cache_updated_at else None,
+        "accepted_at": datetime.utcnow().isoformat(),
+        "hint": "Permintaan diterima. Player akan sinkron saat menerima event config_changed/polling berikutnya.",
     }
 
 
@@ -438,20 +484,31 @@ def list_devices(request: Request, account_id: str | None = None, db: Session = 
             db.refresh(device)
     if resolved_account:
         devices = [d for d in devices if not d.owner_account or d.owner_account == resolved_account]
-    return [
-        {
-            "id": str(d.id),
-            "legacy_id": d.legacy_id,
-            "client_ip": d.client_ip,
-            "name": d.name,
-            "location": d.location,
-            "last_seen": d.last_seen,
-            "status": d.status,
-            "orientation": d.orientation,
-            "owner_account": d.owner_account,
-        }
-        for d in devices
-    ]
+    return_data = []
+    for d in devices:
+        media_cache_status = _compute_media_cache_status(db, d)
+        return_data.append(
+            {
+                "id": str(d.id),
+                "legacy_id": d.legacy_id,
+                "client_ip": d.client_ip,
+                "name": d.name,
+                "location": d.location,
+                "last_seen": d.last_seen,
+                "status": d.status,
+                "orientation": d.orientation,
+                "owner_account": d.owner_account,
+                "media_download_ready": media_cache_status["ready"],
+                "media_download_status": media_cache_status["download_status"],
+                "media_download_status_label": media_cache_status["download_status_label"],
+                "media_download_status_color": media_cache_status["download_status_color"],
+                "media_required_count": media_cache_status["required_count"],
+                "media_cached_count": media_cache_status["cached_count"],
+                "media_missing_count": media_cache_status["missing_count"],
+                "media_cache_updated_at": media_cache_status["cache_updated_at"],
+            }
+        )
+    return return_data
 
 @router.put("/{device_id}")
 def update_device(
