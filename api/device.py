@@ -491,6 +491,9 @@ def _persist_device_sync_plan(db: Session, device_id: str, plan: dict) -> dict:
     state.eta_sec = None
     state.last_error = None
     state.last_report_at = now
+    state.ack_source = None
+    state.ack_reason = None
+    state.ack_at = None
     db.commit()
 
     return {
@@ -525,11 +528,16 @@ def _device_sync_status_payload(db: Session, device_id: str) -> dict:
             "ready": True,
             "items": [],
             "last_report_at": None,
+            "ack_source": None,
+            "ack_reason": None,
+            "ack_at": None,
         }
 
     queued_count = 0
     downloading_count = 0
     verifying_count = 0
+    completed_count = 0
+    failed_count = 0
     failed_items: list[dict] = []
     for row in items:
         status = str(row.status or "queued")
@@ -539,7 +547,10 @@ def _device_sync_status_payload(db: Session, device_id: str) -> dict:
             downloading_count += 1
         elif status == "verifying":
             verifying_count += 1
+        elif status in {"completed", "skipped"}:
+            completed_count += 1
         elif status == "failed":
+            failed_count += 1
             failed_items.append(
                 {
                     "media_id": str(row.media_id),
@@ -560,8 +571,8 @@ def _device_sync_status_payload(db: Session, device_id: str) -> dict:
         "progress_percent": progress_percent,
         "downloaded_bytes": int(state.downloaded_bytes or 0),
         "total_bytes": denominator,
-        "completed_count": int(state.completed_count or 0),
-        "failed_count": int(state.failed_count or 0),
+        "completed_count": completed_count,
+        "failed_count": failed_count,
         "queued_count": queued_count,
         "downloading_count": downloading_count,
         "verifying_count": verifying_count,
@@ -571,7 +582,75 @@ def _device_sync_status_payload(db: Session, device_id: str) -> dict:
         "failed_items": failed_items[:20],
         "last_error": state.last_error,
         "last_report_at": state.last_report_at.isoformat() if state.last_report_at else None,
+        "ack_source": state.ack_source,
+        "ack_reason": state.ack_reason,
+        "ack_at": state.ack_at.isoformat() if state.ack_at else None,
         "updated_at": state.updated_at.isoformat() if state.updated_at else None,
+    }
+
+
+def _summarize_sync_items(db: Session, device_id: str, plan_revision: str) -> dict:
+    rows = (
+        db.query(DeviceSyncItem.status, DeviceSyncItem.priority)
+        .filter(
+            DeviceSyncItem.device_id == device_id,
+            DeviceSyncItem.plan_revision == plan_revision,
+        )
+        .all()
+    )
+    queued_count = 0
+    downloading_count = 0
+    verifying_count = 0
+    completed_count = 0
+    failed_count = 0
+    critical_total = 0
+    critical_completed = 0
+    critical_failed = 0
+    critical_blocking = 0
+    noncritical_failed = 0
+
+    for status, priority in rows:
+        normalized = str(status or "queued").strip().lower()
+        lane = str(priority or "P3").strip().upper()
+        is_critical = lane in {"P0", "P1"}
+        if is_critical:
+            critical_total += 1
+
+        if normalized in {"completed", "skipped"}:
+            completed_count += 1
+            if is_critical:
+                critical_completed += 1
+        elif normalized == "failed":
+            failed_count += 1
+            if is_critical:
+                critical_failed += 1
+            else:
+                noncritical_failed += 1
+        elif normalized == "downloading":
+            downloading_count += 1
+            if is_critical:
+                critical_blocking += 1
+        elif normalized == "verifying":
+            verifying_count += 1
+            if is_critical:
+                critical_blocking += 1
+        else:
+            queued_count += 1
+            if is_critical:
+                critical_blocking += 1
+
+    return {
+        "total_items": len(rows),
+        "queued_count": queued_count,
+        "downloading_count": downloading_count,
+        "verifying_count": verifying_count,
+        "completed_count": completed_count,
+        "failed_count": failed_count,
+        "critical_total": critical_total,
+        "critical_completed": critical_completed,
+        "critical_failed": critical_failed,
+        "critical_blocking": critical_blocking,
+        "noncritical_failed": noncritical_failed,
     }
 
 
@@ -731,31 +810,21 @@ def device_sync_progress(
             if isinstance(retry_value, int) and retry_value >= 0:
                 sync_item.retry_count = retry_value
 
-        stats = (
-            db.query(DeviceSyncItem.status)
-            .filter(
-                DeviceSyncItem.device_id == str(device.id),
-                DeviceSyncItem.plan_revision == revision,
-            )
-            .all()
+        summary = _summarize_sync_items(db, str(device.id), revision)
+        state.completed_count = int(summary["completed_count"])
+        state.failed_count = int(summary["failed_count"])
+        blocking_count = (
+            int(summary["queued_count"])
+            + int(summary["downloading_count"])
+            + int(summary["verifying_count"])
         )
-        completed_count = 0
-        failed_count = 0
-        blocking_count = 0
-        for (status,) in stats:
-            normalized = str(status or "queued")
-            if normalized in {"completed", "skipped"}:
-                completed_count += 1
-            elif normalized == "failed":
-                failed_count += 1
+        if blocking_count == 0:
+            if int(summary["failed_count"]) == 0:
+                state.queue_status = "ready"
+            elif int(summary["critical_failed"]) == 0:
+                state.queue_status = "ready_with_warnings"
             else:
-                blocking_count += 1
-        state.completed_count = completed_count
-        state.failed_count = failed_count
-        if failed_count > 0:
-            state.queue_status = "partial_ready" if blocking_count == 0 else "failed"
-        elif blocking_count == 0:
-            state.queue_status = "ready"
+                state.queue_status = "failed"
 
     db.commit()
     return {
@@ -788,6 +857,8 @@ def device_sync_ack(
     request: Request,
     plan_revision: str | None = None,
     queue_status: str | None = "ready",
+    ack_source: str | None = "device",
+    ack_reason: str | None = None,
     account_id: str | None = None,
     db: Session = Depends(get_db),
 ):
@@ -799,14 +870,80 @@ def device_sync_ack(
     state = _upsert_device_sync_state(db, str(device.id))
     if plan_revision:
         state.plan_revision = str(plan_revision).strip()
-    state.queue_status = str(queue_status or "ready").strip().lower() or "ready"
+    revision = str(state.plan_revision or "").strip()
+    if not revision:
+        raise HTTPException(status_code=400, detail="sync-ack requires plan_revision")
+
+    summary = _summarize_sync_items(db, str(device.id), revision)
+    state.completed_count = int(summary["completed_count"])
+    state.failed_count = int(summary["failed_count"])
+    cache_status = _compute_media_cache_status(db, device)
+    blocking_count = (
+        int(summary["queued_count"])
+        + int(summary["downloading_count"])
+        + int(summary["verifying_count"])
+    )
+    critical_complete = int(summary["critical_completed"]) >= int(summary["critical_total"])
+    critical_clean = int(summary["critical_failed"]) == 0 and int(summary["critical_blocking"]) == 0
+    queue_empty = blocking_count == 0
+    no_failures = int(summary["failed_count"]) == 0
+    cache_ready = cache_status.get("ready") is True
+
+    can_ready = no_failures and queue_empty and critical_complete and critical_clean and cache_ready
+    can_ready_with_warnings = (
+        queue_empty
+        and critical_complete
+        and critical_clean
+        and int(summary["noncritical_failed"]) > 0
+    )
+
+    state.ack_source = (ack_source or "").strip() or "device"
+    state.ack_reason = (ack_reason or "").strip() or None
+    state.ack_at = datetime.utcnow()
+    state.last_report_at = state.ack_at
+
+    if can_ready:
+        state.queue_status = "ready"
+    elif can_ready_with_warnings:
+        state.queue_status = "ready_with_warnings"
+    else:
+        state.queue_status = "failed"
+        state.last_error = "sync_ack_rejected_guard_failed"
+        db.commit()
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "sync-ack rejected by guard",
+                "required": {
+                    "failed_count": 0,
+                    "queued_downloading_verifying": 0,
+                    "critical_p0_p1_completed": True,
+                    "media_cache_ready": True,
+                },
+                "actual": {
+                    "failed_count": int(summary["failed_count"]),
+                    "queued_count": int(summary["queued_count"]),
+                    "downloading_count": int(summary["downloading_count"]),
+                    "verifying_count": int(summary["verifying_count"]),
+                    "critical_total": int(summary["critical_total"]),
+                    "critical_completed": int(summary["critical_completed"]),
+                    "critical_failed": int(summary["critical_failed"]),
+                    "noncritical_failed": int(summary["noncritical_failed"]),
+                    "media_cache_ready": cache_ready,
+                    "media_cache_missing_count": int(cache_status.get("missing_count", 0) or 0),
+                },
+            },
+        )
+
     state.current_media_id = None
     state.eta_sec = 0
-    state.last_report_at = datetime.utcnow()
     db.commit()
     return {
         "ok": True,
         "device_id": str(device.id),
+        "ack_source": state.ack_source,
+        "ack_reason": state.ack_reason,
+        "ack_at": state.ack_at.isoformat() if state.ack_at else None,
         **_device_sync_status_payload(db, str(device.id)),
     }
 

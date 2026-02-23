@@ -192,3 +192,16 @@ def ensure_sqlite_schema():
                 "WHERE flash_countdown_sec IS NOT NULL AND flash_countdown_sec <= 0"
             )
         )
+
+        sync_state_exists = conn.execute(
+            text("SELECT name FROM sqlite_master WHERE type='table' AND name='device_sync_state'")
+        ).fetchone()
+        if sync_state_exists:
+            sync_state_cols = conn.execute(text("PRAGMA table_info(device_sync_state)")).fetchall()
+            sync_state_col_names = {row[1] for row in sync_state_cols}
+            if "ack_source" not in sync_state_col_names:
+                conn.execute(text("ALTER TABLE device_sync_state ADD COLUMN ack_source VARCHAR"))
+            if "ack_reason" not in sync_state_col_names:
+                conn.execute(text("ALTER TABLE device_sync_state ADD COLUMN ack_reason TEXT"))
+            if "ack_at" not in sync_state_col_names:
+                conn.execute(text("ALTER TABLE device_sync_state ADD COLUMN ack_at DATETIME"))

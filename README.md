@@ -34,6 +34,9 @@ FastAPI backend for digital signage operations: media catalog, playlists, schedu
   - `GET /devices/{device_id}/sync-status`
   - `POST /devices/{device_id}/sync-ack`
   - Supports priority lanes (`P0` flash sale, `P1` active playlist, `P2` upcoming schedule, `P3` background) and delta action (`download`/`skip`).
+  - `sync-ack` is now guarded: final `ready` requires no failed item, no queued/downloading/verifying item, critical lane (`P0/P1`) completed, and media-cache status ready.
+  - Non-critical failures can return `ready_with_warnings`.
+  - Ack audit fields persisted: `ack_source`, `ack_reason`, `ack_at`.
 
 ## Features
 - Device provisioning with ownership guard

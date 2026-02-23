@@ -21,6 +21,9 @@ class DeviceSyncState(Base):
     current_media_id = Column(String(36), nullable=True)
     last_error = Column(Text, nullable=True)
     last_report_at = Column(DateTime, nullable=True)
+    ack_source = Column(String(64), nullable=True)
+    ack_reason = Column(Text, nullable=True)
+    ack_at = Column(DateTime, nullable=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
