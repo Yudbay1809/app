@@ -4,6 +4,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 from app.db import SessionLocal
 from app.models.device import Device
+from app.models.device_sync import DeviceSyncItem, DeviceSyncState
 from app.models.flash_sale import FlashSaleConfig
 from app.models.screen import Screen
 from app.models.schedule import Schedule
@@ -15,6 +16,7 @@ from datetime import datetime, timedelta
 router = APIRouter(prefix="/devices", tags=["devices"])
 DEVICE_OFFLINE_AFTER_SEC = int(os.getenv("SIGNAGE_DEVICE_OFFLINE_AFTER_SEC", "70"))
 DEFAULT_TRANSITION_DURATION_SEC = 1
+SYNC_PRELOAD_WINDOW_MIN = int(os.getenv("SIGNAGE_SYNC_PRELOAD_WINDOW_MIN", "30"))
 
 def get_db():
     db = SessionLocal()
@@ -296,6 +298,283 @@ def _resolve_flash_sale_runtime(config: FlashSaleConfig | None, now: datetime) -
     }
 
 
+def _priority_rank(priority: str) -> int:
+    ranking = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
+    return ranking.get(priority, 9)
+
+
+def _playlist_media_ids(db: Session, playlist_id: str) -> set[str]:
+    if not playlist_id:
+        return set()
+    rows = db.query(PlaylistItem.media_id).filter(PlaylistItem.playlist_id == playlist_id).all()
+    return {str(media_id) for (media_id,) in rows if media_id}
+
+
+def _schedule_start_datetime_for_day(base_day: datetime, value) -> datetime | None:
+    if value is None:
+        return None
+    return datetime(
+        base_day.year,
+        base_day.month,
+        base_day.day,
+        value.hour,
+        value.minute,
+        value.second,
+    )
+
+
+def _build_device_sync_plan(db: Session, device: Device) -> dict:
+    now = datetime.utcnow()
+    flash_media_ids: set[str] = set()
+    active_playlist_media_ids: set[str] = set()
+    upcoming_playlist_media_ids: set[str] = set()
+
+    # P0: flash sale active now
+    flash_sale_config = db.query(FlashSaleConfig).filter(FlashSaleConfig.device_id == device.id).first()
+    flash_sale_runtime = _resolve_flash_sale_runtime(flash_sale_config, now)
+    if flash_sale_runtime and flash_sale_runtime.get("active") and flash_sale_runtime.get("products_json"):
+        try:
+            rows = json.loads(flash_sale_runtime["products_json"])
+            if isinstance(rows, list):
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    media_id = str(row.get("media_id", "")).strip()
+                    if media_id:
+                        flash_media_ids.add(media_id)
+        except Exception:
+            pass
+
+    screens = db.query(Screen).filter(Screen.device_id == device.id).all()
+    preload_until = now + timedelta(minutes=SYNC_PRELOAD_WINDOW_MIN)
+
+    # P1: active playlist per-screen
+    for screen in screens:
+        active_id = str(screen.active_playlist_id or "").strip()
+        if active_id:
+            active_playlist_media_ids.update(_playlist_media_ids(db, active_id))
+
+    # P2: schedule starting soon (within preload window)
+    for screen in screens:
+        schedules = db.query(Schedule).filter(Schedule.screen_id == screen.id).all()
+        for item in schedules:
+            if item.start_time is None:
+                continue
+            for day_offset in (0, 1):
+                base_day = now + timedelta(days=day_offset)
+                if int(item.day_of_week) != (base_day.weekday() % 7):
+                    continue
+                start_at = _schedule_start_datetime_for_day(base_day, item.start_time)
+                if start_at is None:
+                    continue
+                if now <= start_at <= preload_until:
+                    upcoming_playlist_media_ids.update(_playlist_media_ids(db, str(item.playlist_id)))
+
+    all_required_ids = _collect_required_media_ids(db, device)
+    cached_ids = _parse_cached_media_ids(device.cached_media_ids)
+
+    priority_by_media: dict[str, tuple[str, str]] = {}
+
+    for media_id in flash_media_ids:
+        priority_by_media[media_id] = ("P0", "flash_sale_active")
+    for media_id in active_playlist_media_ids:
+        existing = priority_by_media.get(media_id)
+        if not existing or _priority_rank("P1") < _priority_rank(existing[0]):
+            priority_by_media[media_id] = ("P1", "playlist_active")
+    for media_id in upcoming_playlist_media_ids:
+        existing = priority_by_media.get(media_id)
+        if not existing or _priority_rank("P2") < _priority_rank(existing[0]):
+            priority_by_media[media_id] = ("P2", "schedule_upcoming")
+    for media_id in all_required_ids:
+        if media_id not in priority_by_media:
+            priority_by_media[media_id] = ("P3", "background_required")
+
+    ordered_ids = sorted(
+        priority_by_media.keys(),
+        key=lambda media_id: (_priority_rank(priority_by_media[media_id][0]), media_id),
+    )
+    media_rows = (
+        db.query(Media)
+        .filter(Media.id.in_(ordered_ids))
+        .all()
+        if ordered_ids
+        else []
+    )
+    media_by_id = {str(row.id): row for row in media_rows}
+
+    plan_items: list[dict] = []
+    total_bytes = 0
+    total_download_bytes = 0
+    download_count = 0
+    for media_id in ordered_ids:
+        media_row = media_by_id.get(media_id)
+        if media_row is None:
+            continue
+        priority, required_by = priority_by_media[media_id]
+        size = int(media_row.size or 0)
+        total_bytes += size
+        action = "skip" if media_id in cached_ids else "download"
+        if action == "download":
+            total_download_bytes += size
+            download_count += 1
+        plan_items.append(
+            {
+                "media_id": media_id,
+                "name": media_row.name,
+                "path": media_row.path,
+                "checksum": media_row.checksum,
+                "size": size,
+                "priority": priority,
+                "required_by": required_by,
+                "action": action,
+            }
+        )
+
+    status = "ready" if download_count == 0 else "queued"
+    return {
+        "plan_revision": now.strftime("%Y%m%d%H%M%S%f"),
+        "generated_at": now.isoformat(),
+        "preload_window_min": SYNC_PRELOAD_WINDOW_MIN,
+        "queue_status": status,
+        "items": plan_items,
+        "summary": {
+            "total_items": len(plan_items),
+            "download_count": download_count,
+            "skip_count": len(plan_items) - download_count,
+            "total_bytes": total_bytes,
+            "download_bytes": total_download_bytes,
+        },
+    }
+
+
+def _upsert_device_sync_state(db: Session, device_id: str) -> DeviceSyncState:
+    state = db.query(DeviceSyncState).filter(DeviceSyncState.device_id == device_id).first()
+    if state:
+        return state
+    state = DeviceSyncState(device_id=device_id, queue_status="idle")
+    db.add(state)
+    db.flush()
+    return state
+
+
+def _persist_device_sync_plan(db: Session, device_id: str, plan: dict) -> dict:
+    revision = str(plan.get("plan_revision", "")).strip()
+    rows = plan.get("items", []) if isinstance(plan.get("items", []), list) else []
+    now = datetime.utcnow()
+
+    db.query(DeviceSyncItem).filter(DeviceSyncItem.device_id == device_id).delete(synchronize_session=False)
+    for row in rows:
+        media_id = str(row.get("media_id", "")).strip()
+        if not media_id:
+            continue
+        item_status = "skipped" if row.get("action") == "skip" else "queued"
+        db.add(
+            DeviceSyncItem(
+                device_id=device_id,
+                plan_revision=revision,
+                media_id=media_id,
+                priority=str(row.get("priority", "P3")),
+                required_by=str(row.get("required_by", "background_required")),
+                status=item_status,
+            )
+        )
+
+    state = _upsert_device_sync_state(db, device_id)
+    summary = plan.get("summary", {}) if isinstance(plan.get("summary"), dict) else {}
+    state.plan_revision = revision
+    state.queue_status = str(plan.get("queue_status", "queued"))
+    state.total_bytes = int(summary.get("download_bytes", 0) or 0)
+    state.downloaded_bytes = 0
+    state.completed_count = int(summary.get("skip_count", 0) or 0)
+    state.failed_count = 0
+    state.current_media_id = None
+    state.eta_sec = None
+    state.last_error = None
+    state.last_report_at = now
+    db.commit()
+
+    return {
+        "queue_status": state.queue_status,
+        "completed_count": state.completed_count,
+        "failed_count": state.failed_count,
+        "downloaded_bytes": state.downloaded_bytes,
+        "total_bytes": state.total_bytes,
+        "last_report_at": state.last_report_at.isoformat() if state.last_report_at else None,
+    }
+
+
+def _device_sync_status_payload(db: Session, device_id: str) -> dict:
+    state = db.query(DeviceSyncState).filter(DeviceSyncState.device_id == device_id).first()
+    items = (
+        db.query(DeviceSyncItem)
+        .filter(DeviceSyncItem.device_id == device_id)
+        .all()
+    )
+    if state is None:
+        return {
+            "queue_status": "idle",
+            "plan_revision": None,
+            "progress_percent": 0,
+            "downloaded_bytes": 0,
+            "total_bytes": 0,
+            "completed_count": 0,
+            "failed_count": 0,
+            "queued_count": 0,
+            "downloading_count": 0,
+            "verifying_count": 0,
+            "ready": True,
+            "items": [],
+            "last_report_at": None,
+        }
+
+    queued_count = 0
+    downloading_count = 0
+    verifying_count = 0
+    failed_items: list[dict] = []
+    for row in items:
+        status = str(row.status or "queued")
+        if status == "queued":
+            queued_count += 1
+        elif status == "downloading":
+            downloading_count += 1
+        elif status == "verifying":
+            verifying_count += 1
+        elif status == "failed":
+            failed_items.append(
+                {
+                    "media_id": str(row.media_id),
+                    "priority": row.priority,
+                    "required_by": row.required_by,
+                    "error": row.error,
+                    "retry_count": row.retry_count,
+                }
+            )
+
+    denominator = int(state.total_bytes or 0)
+    progress_percent = 100 if denominator == 0 else min(100, int((int(state.downloaded_bytes or 0) * 100) / denominator))
+    ready = state.queue_status == "ready"
+
+    return {
+        "queue_status": state.queue_status,
+        "plan_revision": state.plan_revision,
+        "progress_percent": progress_percent,
+        "downloaded_bytes": int(state.downloaded_bytes or 0),
+        "total_bytes": denominator,
+        "completed_count": int(state.completed_count or 0),
+        "failed_count": int(state.failed_count or 0),
+        "queued_count": queued_count,
+        "downloading_count": downloading_count,
+        "verifying_count": verifying_count,
+        "current_media_id": state.current_media_id,
+        "eta_sec": state.eta_sec,
+        "ready": ready,
+        "failed_items": failed_items[:20],
+        "last_error": state.last_error,
+        "last_report_at": state.last_report_at.isoformat() if state.last_report_at else None,
+        "updated_at": state.updated_at.isoformat() if state.updated_at else None,
+    }
+
+
 @router.post("/{device_id}/media-cache-report")
 def media_cache_report(
     device_id: str,
@@ -353,6 +632,182 @@ def request_media_download(
         "device_id": str(device.id),
         "accepted_at": datetime.utcnow().isoformat(),
         "hint": "Permintaan diterima. Player akan sinkron saat menerima event config_changed/polling berikutnya.",
+    }
+
+
+@router.get("/{device_id}/sync-plan")
+def device_sync_plan(
+    device_id: str,
+    request: Request,
+    account_id: str | None = None,
+    db: Session = Depends(get_db),
+):
+    device = _find_device(db, device_id)
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+    _enforce_device_owner(device, _resolve_account_id(request, account_id))
+
+    plan = _build_device_sync_plan(db, device)
+    persisted = _persist_device_sync_plan(db, str(device.id), plan)
+    return {
+        "device_id": str(device.id),
+        **plan,
+        "state": persisted,
+    }
+
+
+@router.post("/{device_id}/sync-progress")
+def device_sync_progress(
+    device_id: str,
+    request: Request,
+    plan_revision: str | None = None,
+    queue_status: str | None = None,
+    downloaded_bytes: int | None = None,
+    total_bytes: int | None = None,
+    current_media_id: str | None = None,
+    eta_sec: int | None = None,
+    completed_ids: list[str] = Body(default=[]),
+    failed_items: list[dict] = Body(default=[]),
+    account_id: str | None = None,
+    db: Session = Depends(get_db),
+):
+    device = _find_device(db, device_id)
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+    _enforce_device_owner(device, _resolve_account_id(request, account_id))
+
+    state = _upsert_device_sync_state(db, str(device.id))
+    if plan_revision:
+        state.plan_revision = str(plan_revision).strip()
+    if queue_status:
+        state.queue_status = str(queue_status).strip().lower()
+    if downloaded_bytes is not None and downloaded_bytes >= 0:
+        state.downloaded_bytes = int(downloaded_bytes)
+    if total_bytes is not None and total_bytes >= 0:
+        state.total_bytes = int(total_bytes)
+    if eta_sec is not None:
+        state.eta_sec = int(eta_sec) if eta_sec >= 0 else None
+    if current_media_id is not None:
+        state.current_media_id = str(current_media_id).strip() or None
+    state.last_report_at = datetime.utcnow()
+
+    revision = str(state.plan_revision or "").strip()
+    if revision:
+        completion_set = {str(item).strip() for item in (completed_ids or []) if str(item).strip()}
+        if completion_set:
+            rows = (
+                db.query(DeviceSyncItem)
+                .filter(
+                    DeviceSyncItem.device_id == str(device.id),
+                    DeviceSyncItem.plan_revision == revision,
+                    DeviceSyncItem.media_id.in_(list(completion_set)),
+                )
+                .all()
+            )
+            for row in rows:
+                row.status = "completed"
+                row.error = None
+
+        for row in failed_items or []:
+            if not isinstance(row, dict):
+                continue
+            media_id = str(row.get("media_id", "")).strip()
+            if not media_id:
+                continue
+            sync_item = (
+                db.query(DeviceSyncItem)
+                .filter(
+                    DeviceSyncItem.device_id == str(device.id),
+                    DeviceSyncItem.plan_revision == revision,
+                    DeviceSyncItem.media_id == media_id,
+                )
+                .first()
+            )
+            if not sync_item:
+                continue
+            sync_item.status = "failed"
+            sync_item.error = str(row.get("error", "")).strip() or "download_failed"
+            retry_value = row.get("retry_count")
+            if isinstance(retry_value, int) and retry_value >= 0:
+                sync_item.retry_count = retry_value
+
+        stats = (
+            db.query(DeviceSyncItem.status)
+            .filter(
+                DeviceSyncItem.device_id == str(device.id),
+                DeviceSyncItem.plan_revision == revision,
+            )
+            .all()
+        )
+        completed_count = 0
+        failed_count = 0
+        blocking_count = 0
+        for (status,) in stats:
+            normalized = str(status or "queued")
+            if normalized in {"completed", "skipped"}:
+                completed_count += 1
+            elif normalized == "failed":
+                failed_count += 1
+            else:
+                blocking_count += 1
+        state.completed_count = completed_count
+        state.failed_count = failed_count
+        if failed_count > 0:
+            state.queue_status = "partial_ready" if blocking_count == 0 else "failed"
+        elif blocking_count == 0:
+            state.queue_status = "ready"
+
+    db.commit()
+    return {
+        "ok": True,
+        "device_id": str(device.id),
+        **_device_sync_status_payload(db, str(device.id)),
+    }
+
+
+@router.get("/{device_id}/sync-status")
+def device_sync_status(
+    device_id: str,
+    request: Request,
+    account_id: str | None = None,
+    db: Session = Depends(get_db),
+):
+    device = _find_device(db, device_id)
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+    _enforce_device_owner(device, _resolve_account_id(request, account_id))
+    return {
+        "device_id": str(device.id),
+        **_device_sync_status_payload(db, str(device.id)),
+    }
+
+
+@router.post("/{device_id}/sync-ack")
+def device_sync_ack(
+    device_id: str,
+    request: Request,
+    plan_revision: str | None = None,
+    queue_status: str | None = "ready",
+    account_id: str | None = None,
+    db: Session = Depends(get_db),
+):
+    device = _find_device(db, device_id)
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+    _enforce_device_owner(device, _resolve_account_id(request, account_id))
+
+    state = _upsert_device_sync_state(db, str(device.id))
+    if plan_revision:
+        state.plan_revision = str(plan_revision).strip()
+    state.queue_status = str(queue_status or "ready").strip().lower() or "ready"
+    state.current_media_id = None
+    state.eta_sec = 0
+    state.last_report_at = datetime.utcnow()
+    db.commit()
+    return {
+        "ok": True,
+        "device_id": str(device.id),
+        **_device_sync_status_payload(db, str(device.id)),
     }
 
 
@@ -565,6 +1020,8 @@ def delete_device(device_id: str, request: Request, account_id: str | None = Non
         db.query(Screen).filter(Screen.id.in_(screen_ids)).delete(synchronize_session=False)
 
     db.query(FlashSaleConfig).filter(FlashSaleConfig.device_id == device.id).delete(synchronize_session=False)
+    db.query(DeviceSyncItem).filter(DeviceSyncItem.device_id == device.id).delete(synchronize_session=False)
+    db.query(DeviceSyncState).filter(DeviceSyncState.device_id == device.id).delete(synchronize_session=False)
     db.delete(device)
     db.commit()
     return {"ok": True}

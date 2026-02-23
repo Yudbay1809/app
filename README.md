@@ -28,6 +28,12 @@ FastAPI backend for digital signage operations: media catalog, playlists, schedu
 - `GET /devices/{id}/config` media payload now includes `size` for client-side playback guard.
 - Device config now supports central playlist references: `GET /devices/{id}/config` includes playlists referenced by `active_playlist_id` and schedule even across other screens/devices.
 - Playlist media type is now enforced as single-type per playlist (photo-only or video-only). Mixed media insertion is rejected at API level.
+- Smart Media Sync endpoints added:
+  - `GET /devices/{device_id}/sync-plan`
+  - `POST /devices/{device_id}/sync-progress`
+  - `GET /devices/{device_id}/sync-status`
+  - `POST /devices/{device_id}/sync-ack`
+  - Supports priority lanes (`P0` flash sale, `P1` active playlist, `P2` upcoming schedule, `P3` background) and delta action (`download`/`skip`).
 
 ## Features
 - Device provisioning with ownership guard
@@ -87,6 +93,10 @@ Open docs:
 - `POST /devices/{device_id}/media-cache-report`
 - `GET /devices/{device_id}/media-cache-status`
 - `POST /devices/{device_id}/request-media-download`
+- `GET /devices/{device_id}/sync-plan`
+- `POST /devices/{device_id}/sync-progress`
+- `GET /devices/{device_id}/sync-status`
+- `POST /devices/{device_id}/sync-ack`
 - `PUT /flash-sale/device/{device_id}/now`
 - `PUT /flash-sale/device/{device_id}/schedule`
 - `DELETE /flash-sale/device/{device_id}`
