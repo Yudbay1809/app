@@ -298,6 +298,81 @@ def _resolve_flash_sale_runtime(config: FlashSaleConfig | None, now: datetime) -
     }
 
 
+def _flash_sale_media_ids_from_runtime(runtime: dict | None) -> set[str]:
+    if not runtime:
+        return set()
+    raw = runtime.get("products_json")
+    if not raw:
+        return set()
+    output: set[str] = set()
+    try:
+        rows = json.loads(raw)
+        if isinstance(rows, list):
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                media_id = str(row.get("media_id", "")).strip()
+                if media_id:
+                    output.add(media_id)
+    except Exception:
+        return set()
+    return output
+
+
+def _apply_flash_sale_preload_guard(db: Session, device: Device, runtime: dict | None) -> dict | None:
+    if runtime is None:
+        return None
+
+    enriched = dict(runtime)
+    required_ids = _flash_sale_media_ids_from_runtime(enriched)
+    cached_ids = _parse_cached_media_ids(device.cached_media_ids)
+    missing_ids = sorted(required_ids - cached_ids)
+    sync_status = _device_sync_status_payload(db, str(device.id))
+    queue_status = str(sync_status.get("queue_status", "idle"))
+    progress_percent = int(sync_status.get("progress_percent", 0) or 0)
+
+    runtime_active = bool(enriched.get("active"))
+    enabled = bool(enriched.get("enabled"))
+
+    # Countdown gate: campaign can be enabled/active by schedule, but display waits
+    # until all flash-sale media (P0) are confirmed in cache.
+    if not enabled:
+        runtime_state = "blocked"
+        display_active = False
+        guard_reason = "disabled"
+    elif not runtime_active:
+        runtime_state = "blocked"
+        display_active = False
+        guard_reason = "inactive_window"
+    elif len(required_ids) == 0:
+        runtime_state = "blocked"
+        display_active = False
+        guard_reason = "no_products"
+    elif len(missing_ids) == 0:
+        runtime_state = "live"
+        display_active = True
+        guard_reason = "ready"
+    elif queue_status == "failed":
+        runtime_state = "blocked"
+        display_active = False
+        guard_reason = "sync_failed"
+    else:
+        runtime_state = "preparing"
+        display_active = False
+        guard_reason = "waiting_media"
+
+    enriched["runtime_state"] = runtime_state
+    enriched["display_active"] = display_active
+    enriched["guard_reason"] = guard_reason
+    enriched["required_media_count"] = len(required_ids)
+    enriched["cached_media_count"] = len(required_ids) - len(missing_ids)
+    enriched["missing_media_count"] = len(missing_ids)
+    enriched["missing_media_ids"] = missing_ids
+    enriched["sync_queue_status"] = queue_status
+    enriched["sync_progress_percent"] = progress_percent
+    return enriched
+
+
 def _priority_rank(priority: str) -> int:
     ranking = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
     return ranking.get(priority, 9)
@@ -1230,6 +1305,7 @@ def device_config(device_id: str, request: Request, account_id: str | None = Non
     flash_sale_runtime = None
     flash_sale_config = db.query(FlashSaleConfig).filter(FlashSaleConfig.device_id == device.id).first()
     flash_sale_runtime = _resolve_flash_sale_runtime(flash_sale_config, datetime.utcnow())
+    flash_sale_runtime = _apply_flash_sale_preload_guard(db, device, flash_sale_runtime)
     if flash_sale_runtime and flash_sale_runtime.get("products_json"):
         try:
             rows = json.loads(flash_sale_runtime["products_json"])
