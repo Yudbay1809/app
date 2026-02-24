@@ -4,6 +4,7 @@ import asyncio
 import logging
 import subprocess
 import re
+import time
 from datetime import datetime, timezone
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -27,6 +28,9 @@ DEVICE_STATUS_SWEEP_SEC = int(os.getenv("SIGNAGE_DEVICE_STATUS_SWEEP_SEC", "5"))
 QUIET_ACCESS_LOG = os.getenv("SIGNAGE_QUIET_ACCESS_LOG", "1").strip().lower() in {"1", "true", "yes", "on"}
 QUIET_WEBSOCKET_LOG = os.getenv("SIGNAGE_QUIET_WEBSOCKET_LOG", "1").strip().lower() in {"1", "true", "yes", "on"}
 _device_status_task: asyncio.Task | None = None
+_primary_ip_cache: str | None = None
+_primary_ip_cache_at: float = 0.0
+PRIMARY_IP_CACHE_TTL_SEC = int(os.getenv("SIGNAGE_PRIMARY_IP_CACHE_TTL_SEC", "15"))
 
 if QUIET_ACCESS_LOG:
     # Keep warning/error lines, suppress normal access noise (200/201 etc).
@@ -70,7 +74,26 @@ def _is_private_ip(ip: str) -> bool:
 def _ip_from_default_gateway_adapter() -> str | None:
     # On Windows, pick the IPv4 from the adapter section that has Default Gateway.
     try:
-        output = subprocess.check_output(["ipconfig"], text=True, encoding="utf-8", errors="ignore")
+        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        startupinfo = None
+        if os.name == "nt":
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = 0
+        completed = subprocess.run(
+            ["ipconfig"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            timeout=3,
+            check=False,
+            startupinfo=startupinfo,
+            creationflags=creation_flags,
+        )
+        output = completed.stdout or ""
+        if not output:
+            return None
     except Exception:
         return None
 
@@ -98,6 +121,16 @@ def _primary_ip() -> str:
     if ips:
         return ips[0]
     return "127.0.0.1"
+
+
+def _primary_ip_cached() -> str:
+    global _primary_ip_cache, _primary_ip_cache_at
+    now = time.time()
+    if _primary_ip_cache and (now - _primary_ip_cache_at) < PRIMARY_IP_CACHE_TTL_SEC:
+        return _primary_ip_cache
+    _primary_ip_cache = _primary_ip()
+    _primary_ip_cache_at = now
+    return _primary_ip_cache
 
 
 def _derive_device_status(last_seen: datetime | None, now_utc: datetime) -> str:
@@ -162,12 +195,12 @@ def root():
 
 @app.get("/healthz")
 def healthz():
-    return {"ok": True, "server_ip": _primary_ip(), "server_port": SERVER_PORT}
+    return {"ok": True, "server_ip": _primary_ip_cached(), "server_port": SERVER_PORT}
 
 
 @app.get("/server-info")
 def server_info():
-    ip = _primary_ip()
+    ip = _primary_ip_cached()
     return {
         "ok": True,
         "server_ip": ip,
