@@ -17,6 +17,13 @@ router = APIRouter(prefix="/devices", tags=["devices"])
 DEVICE_OFFLINE_AFTER_SEC = int(os.getenv("SIGNAGE_DEVICE_OFFLINE_AFTER_SEC", "70"))
 DEFAULT_TRANSITION_DURATION_SEC = 1
 SYNC_PRELOAD_WINDOW_MIN = int(os.getenv("SIGNAGE_SYNC_PRELOAD_WINDOW_MIN", "30"))
+DOWNLOAD_CHANNEL_CHUNK_SIZE = int(os.getenv("SIGNAGE_DOWNLOAD_CHANNEL_CHUNK_SIZE", "20"))
+DOWNLOAD_CHANNEL_MAX_PARALLEL = int(os.getenv("SIGNAGE_DOWNLOAD_MAX_PARALLEL", "3"))
+DOWNLOAD_RETRY_MAX_ATTEMPTS = int(os.getenv("SIGNAGE_DOWNLOAD_RETRY_MAX_ATTEMPTS", "4"))
+DOWNLOAD_CONNECT_TIMEOUT_SEC = int(os.getenv("SIGNAGE_DOWNLOAD_CONNECT_TIMEOUT_SEC", "8"))
+DOWNLOAD_READ_TIMEOUT_SEC = int(os.getenv("SIGNAGE_DOWNLOAD_READ_TIMEOUT_SEC", "60"))
+DOWNLOAD_PRIMARY_BASE_URL = (os.getenv("SIGNAGE_DOWNLOAD_BASE_URL", "") or "").strip().rstrip("/")
+DOWNLOAD_MIRROR_BASE_URL = (os.getenv("SIGNAGE_DOWNLOAD_MIRROR_URL", "") or "").strip().rstrip("/")
 
 def get_db():
     db = SessionLocal()
@@ -51,6 +58,25 @@ def _resolve_client_ip(request: Request) -> str | None:
     if request.client and request.client.host:
         return request.client.host
     return None
+
+
+def _request_origin(request: Request) -> str:
+    forwarded_proto = (request.headers.get("X-Forwarded-Proto") or "").strip()
+    forwarded_host = (request.headers.get("X-Forwarded-Host") or "").strip()
+    if forwarded_host:
+        proto = forwarded_proto or request.url.scheme
+        return f"{proto}://{forwarded_host}".rstrip("/")
+    return str(request.base_url).rstrip("/")
+
+
+def _download_base_urls(request: Request) -> list[str]:
+    output: list[str] = []
+    primary = DOWNLOAD_PRIMARY_BASE_URL or _request_origin(request)
+    if primary:
+        output.append(primary)
+    if DOWNLOAD_MIRROR_BASE_URL and DOWNLOAD_MIRROR_BASE_URL not in output:
+        output.append(DOWNLOAD_MIRROR_BASE_URL)
+    return output
 
 
 def _enforce_device_owner(device: Device, account_id: str | None) -> None:
@@ -807,6 +833,79 @@ def device_sync_plan(
         "device_id": str(device.id),
         **plan,
         "state": persisted,
+    }
+
+
+@router.get("/{device_id}/download-channel")
+def device_download_channel(
+    device_id: str,
+    request: Request,
+    cursor: int = 0,
+    limit: int | None = None,
+    include_skipped: bool = False,
+    account_id: str | None = None,
+    db: Session = Depends(get_db),
+):
+    device = _find_device(db, device_id)
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+    _enforce_device_owner(device, _resolve_account_id(request, account_id))
+
+    plan = _build_device_sync_plan(db, device)
+    persisted = _persist_device_sync_plan(db, str(device.id), plan)
+    all_items = plan.get("items", []) if isinstance(plan.get("items"), list) else []
+    download_items = [row for row in all_items if include_skipped or str(row.get("action")) == "download"]
+
+    safe_cursor = max(0, int(cursor))
+    requested_limit = limit if (limit is not None and limit > 0) else DOWNLOAD_CHANNEL_CHUNK_SIZE
+    safe_limit = max(1, min(int(requested_limit), 100))
+    chunk = download_items[safe_cursor:safe_cursor + safe_limit]
+    next_cursor = safe_cursor + len(chunk)
+    has_more = next_cursor < len(download_items)
+    base_urls = _download_base_urls(request)
+
+    queue_items = []
+    for row in chunk:
+        path = str(row.get("path", "")).strip()
+        if not path:
+            continue
+        urls = [f"{base}{path}" for base in base_urls]
+        queue_items.append(
+            {
+                "media_id": str(row.get("media_id", "")).strip(),
+                "name": row.get("name"),
+                "path": path,
+                "size": int(row.get("size", 0) or 0),
+                "checksum": row.get("checksum"),
+                "priority": row.get("priority"),
+                "required_by": row.get("required_by"),
+                "action": row.get("action"),
+                "urls": urls,
+            }
+        )
+
+    return {
+        "ok": True,
+        "device_id": str(device.id),
+        "plan_revision": plan.get("plan_revision"),
+        "generated_at": plan.get("generated_at"),
+        "queue_status": plan.get("queue_status"),
+        "cursor": safe_cursor,
+        "next_cursor": next_cursor,
+        "chunk_size": safe_limit,
+        "has_more": has_more,
+        "total_items": len(download_items),
+        "state": persisted,
+        "download_policy": {
+            "max_parallel_downloads": DOWNLOAD_CHANNEL_MAX_PARALLEL,
+            "retry_max_attempts": DOWNLOAD_RETRY_MAX_ATTEMPTS,
+            "retry_backoff_ms": [500, 1500, 3000, 5000],
+            "retry_on_status": [408, 429, 500, 502, 503, 504],
+            "connect_timeout_sec": DOWNLOAD_CONNECT_TIMEOUT_SEC,
+            "read_timeout_sec": DOWNLOAD_READ_TIMEOUT_SEC,
+            "supports_resume": True,
+        },
+        "items": queue_items,
     }
 
 
