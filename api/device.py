@@ -161,6 +161,50 @@ def _download_status_presentation(download_status: str) -> tuple[str, str]:
     return mapping.get(download_status, ("Unknown", "#6B7280"))
 
 
+def _download_overview(sync_status: dict, media_cache_status: dict) -> dict:
+    queue_status = str(sync_status.get("queue_status", "idle") or "idle").strip().lower()
+    progress_percent = int(sync_status.get("progress_percent", 0) or 0)
+    failed_count = int(sync_status.get("failed_count", 0) or 0)
+    ready = media_cache_status.get("ready") is True
+    missing_count = int(media_cache_status.get("missing_count", 0) or 0)
+
+    if queue_status == "failed":
+        return {
+            "status": "failed",
+            "label": f"Gagal Download ({failed_count})" if failed_count > 0 else "Gagal Download",
+            "color": "#DC2626",
+        }
+    if queue_status == "ready_with_warnings":
+        return {
+            "status": "ready_with_warnings",
+            "label": "Selesai (Warning)",
+            "color": "#D97706",
+        }
+    if queue_status in {"queued", "downloading", "verifying"}:
+        return {
+            "status": "in_progress",
+            "label": f"Sedang Download {progress_percent}%",
+            "color": "#F59E0B",
+        }
+    if ready:
+        return {
+            "status": "completed",
+            "label": "Selesai",
+            "color": "#16A34A",
+        }
+    if missing_count > 0:
+        return {
+            "status": "pending",
+            "label": f"Menunggu Download ({missing_count})",
+            "color": "#6B7280",
+        }
+    return {
+        "status": "idle",
+        "label": "Idle",
+        "color": "#6B7280",
+    }
+
+
 def _compute_media_cache_status(db: Session, device: Device) -> dict:
     required_ids = _collect_required_media_ids(db, device)
     cached_ids = _parse_cached_media_ids(device.cached_media_ids)
@@ -1253,6 +1297,15 @@ def list_devices(request: Request, account_id: str | None = None, db: Session = 
     return_data = []
     for d in devices:
         media_cache_status = _compute_media_cache_status(db, d)
+        sync_status = _device_sync_status_payload(db, str(d.id))
+        download_overview = _download_overview(sync_status, media_cache_status)
+        sync_total_items = (
+            int(sync_status.get("queued_count", 0) or 0)
+            + int(sync_status.get("downloading_count", 0) or 0)
+            + int(sync_status.get("verifying_count", 0) or 0)
+            + int(sync_status.get("completed_count", 0) or 0)
+            + int(sync_status.get("failed_count", 0) or 0)
+        )
         return_data.append(
             {
                 "id": str(d.id),
@@ -1272,6 +1325,14 @@ def list_devices(request: Request, account_id: str | None = None, db: Session = 
                 "media_cached_count": media_cache_status["cached_count"],
                 "media_missing_count": media_cache_status["missing_count"],
                 "media_cache_updated_at": media_cache_status["cache_updated_at"],
+                "sync_queue_status": sync_status.get("queue_status"),
+                "sync_progress_percent": int(sync_status.get("progress_percent", 0) or 0),
+                "sync_total_items": sync_total_items,
+                "sync_completed_count": int(sync_status.get("completed_count", 0) or 0),
+                "sync_failed_count": int(sync_status.get("failed_count", 0) or 0),
+                "download_overview_status": download_overview["status"],
+                "download_overview_label": download_overview["label"],
+                "download_overview_color": download_overview["color"],
             }
         )
     return return_data
