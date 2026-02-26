@@ -193,6 +193,21 @@ def ensure_sqlite_schema():
             )
         )
 
+        flash_sale_exists = conn.execute(
+            text("SELECT name FROM sqlite_master WHERE type='table' AND name='flash_sale_config'")
+        ).fetchone()
+        if flash_sale_exists:
+            flash_sale_cols = conn.execute(text("PRAGMA table_info(flash_sale_config)")).fetchall()
+            flash_sale_col_names = {row[1] for row in flash_sale_cols}
+            if "warmup_minutes" not in flash_sale_col_names:
+                conn.execute(text("ALTER TABLE flash_sale_config ADD COLUMN warmup_minutes INTEGER"))
+            conn.execute(
+                text(
+                    "UPDATE flash_sale_config SET warmup_minutes=NULL "
+                    "WHERE warmup_minutes IS NOT NULL AND warmup_minutes <= 0"
+                )
+            )
+
         sync_state_exists = conn.execute(
             text("SELECT name FROM sqlite_master WHERE type='table' AND name='device_sync_state'")
         ).fetchone()

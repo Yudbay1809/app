@@ -1,5 +1,7 @@
 import json
-from datetime import datetime
+import math
+import os
+from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
@@ -10,6 +12,7 @@ from app.models.flash_sale import FlashSaleConfig
 from app.models.media import Media
 
 router = APIRouter(prefix="/flash-sale", tags=["flash-sale"])
+DEFAULT_PREFLIGHT_MBPS = float((os.getenv("SIGNAGE_PREFLIGHT_MBPS", "8") or "8").strip())
 
 
 def get_db():
@@ -25,6 +28,16 @@ def _normalize_countdown(value: int | None) -> int | None:
         return None
     if value <= 0:
         return None
+    return value
+
+
+def _normalize_warmup_minutes(value: int | None) -> int | None:
+    if value is None:
+        return None
+    if value <= 0:
+        return None
+    if value > 240:
+        raise HTTPException(status_code=400, detail="warmup_minutes max 240")
     return value
 
 
@@ -132,6 +145,29 @@ def _find_or_create_config(db: Session, device_id: str) -> FlashSaleConfig:
     return config
 
 
+def _parse_cached_media_ids(csv: str | None) -> set[str]:
+    output: set[str] = set()
+    for item in (csv or "").split(","):
+        value = item.strip()
+        if value:
+            output.add(value)
+    return output
+
+
+def _parse_product_rows(products_json: str) -> list[dict]:
+    try:
+        decoded = json.loads(products_json)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid products_json: {exc.msg}") from exc
+    if not isinstance(decoded, list):
+        raise HTTPException(status_code=400, detail="products_json must be a JSON array")
+    rows: list[dict] = []
+    for row in decoded:
+        if isinstance(row, dict):
+            rows.append(row)
+    return rows
+
+
 @router.get("/device/{device_id}")
 def get_flash_sale(device_id: str, db: Session = Depends(get_db)):
     _find_device_or_404(db, device_id)
@@ -148,6 +184,7 @@ def get_flash_sale(device_id: str, db: Session = Depends(get_db)):
             "schedule_days": config.schedule_days,
             "schedule_start_time": config.schedule_start_time,
             "schedule_end_time": config.schedule_end_time,
+            "warmup_minutes": config.warmup_minutes,
             "activated_at": config.activated_at.isoformat() if config.activated_at else None,
             "updated_at": config.updated_at.isoformat() if config.updated_at else None,
         },
@@ -159,6 +196,7 @@ def upsert_flash_sale_now(
     device_id: str,
     note: str | None = None,
     countdown_sec: int | None = None,
+    warmup_minutes: int | None = None,
     products_json: str | None = None,
     db: Session = Depends(get_db),
 ):
@@ -167,6 +205,7 @@ def upsert_flash_sale_now(
     config.enabled = True
     config.note = (note or "").strip() or None
     config.countdown_sec = _normalize_countdown(countdown_sec)
+    config.warmup_minutes = _normalize_warmup_minutes(warmup_minutes)
     config.products_json = _normalize_products_json(products_json, db)
     config.schedule_days = None
     config.schedule_start_time = None
@@ -183,6 +222,7 @@ def upsert_flash_sale_schedule(
     device_id: str,
     note: str | None = None,
     countdown_sec: int | None = None,
+    warmup_minutes: int | None = None,
     products_json: str | None = None,
     schedule_days: str | None = None,
     start_time: str | None = None,
@@ -194,6 +234,7 @@ def upsert_flash_sale_schedule(
     config.enabled = True
     config.note = (note or "").strip() or None
     config.countdown_sec = _normalize_countdown(countdown_sec)
+    config.warmup_minutes = _normalize_warmup_minutes(warmup_minutes)
     config.products_json = _normalize_products_json(products_json, db)
     config.schedule_days = _normalize_schedule_days(schedule_days or "")
     config.schedule_start_time = _normalize_time_hms(start_time or "")
@@ -203,6 +244,72 @@ def upsert_flash_sale_schedule(
     db.commit()
     db.refresh(config)
     return {"ok": True, "device_id": device_id}
+
+
+@router.get("/device/{device_id}/preflight")
+def flash_sale_preflight(
+    device_id: str,
+    products_json: str | None = None,
+    download_mbps: float | None = None,
+    db: Session = Depends(get_db),
+):
+    device = _find_device_or_404(db, device_id)
+    config = db.query(FlashSaleConfig).filter(FlashSaleConfig.device_id == device_id).first()
+    raw_products = (products_json or "").strip()
+    if not raw_products and config:
+        raw_products = (config.products_json or "").strip()
+    if not raw_products:
+        raise HTTPException(status_code=400, detail="products_json is required (query or existing config)")
+
+    normalized_products = _normalize_products_json(raw_products, db)
+    rows = _parse_product_rows(normalized_products)
+    required_ids = {
+        str(row.get("media_id", "")).strip()
+        for row in rows
+        if str(row.get("name", "")).strip() and str(row.get("media_id", "")).strip()
+    }
+    cached_ids = _parse_cached_media_ids(device.cached_media_ids)
+    missing_ids = sorted(required_ids - cached_ids)
+    cached_required_ids = sorted(required_ids & cached_ids)
+
+    missing_media = []
+    missing_total_bytes = 0
+    if missing_ids:
+        missing_media = db.query(Media).filter(Media.id.in_(missing_ids)).all()
+        missing_total_bytes = sum(int(item.size or 0) for item in missing_media)
+
+    mbps = download_mbps if (download_mbps is not None and download_mbps > 0) else DEFAULT_PREFLIGHT_MBPS
+    bytes_per_sec = max(mbps, 0.1) * 1024 * 1024
+    estimated_sec = round(missing_total_bytes / bytes_per_sec, 2) if missing_total_bytes > 0 else 0.0
+    recommended_warmup_minutes = 0
+    if estimated_sec > 0:
+        recommended_warmup_minutes = min(240, max(1, math.ceil((estimated_sec * 1.35) / 60)))
+
+    return {
+        "device_id": str(device.id),
+        "ready": len(missing_ids) == 0,
+        "required_count": len(required_ids),
+        "cached_required_count": len(cached_required_ids),
+        "missing_count": len(missing_ids),
+        "missing_media_ids": missing_ids,
+        "missing_total_bytes": missing_total_bytes,
+        "download_mbps_used": mbps,
+        "estimated_download_sec": estimated_sec,
+        "estimated_download_human": str(timedelta(seconds=int(math.ceil(estimated_sec)))),
+        "recommended_warmup_minutes": recommended_warmup_minutes,
+        "configured_warmup_minutes": (config.warmup_minutes if config else None),
+        "cache_updated_at": device.media_cache_updated_at.isoformat() if device.media_cache_updated_at else None,
+        "missing_media": [
+            {
+                "id": str(item.id),
+                "name": item.name,
+                "type": item.type,
+                "path": item.path,
+                "size": int(item.size or 0),
+            }
+            for item in missing_media
+        ],
+    }
 
 
 @router.delete("/device/{device_id}")

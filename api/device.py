@@ -302,9 +302,12 @@ def _resolve_flash_sale_runtime(config: FlashSaleConfig | None, now: datetime) -
         return None
     enabled = bool(config.enabled)
     countdown_sec = config.countdown_sec if (config.countdown_sec or 0) > 0 else None
+    warmup_minutes = config.warmup_minutes if (config.warmup_minutes or 0) > 0 else None
     active = False
+    warmup_active = False
     runtime_start: datetime | None = None
     runtime_end: datetime | None = None
+    warmup_start: datetime | None = None
     countdown_end: datetime | None = None
 
     has_schedule = bool(
@@ -333,10 +336,14 @@ def _resolve_flash_sale_runtime(config: FlashSaleConfig | None, now: datetime) -
                 end = datetime(now.year, now.month, now.day, hms_end[0], hms_end[1], hms_end[2])
                 if end <= start:
                     end = end + timedelta(days=1)
+                runtime_start = start
+                runtime_end = end
+                if warmup_minutes is not None:
+                    warmup_start = start - timedelta(minutes=warmup_minutes)
+                    if warmup_start <= now < start:
+                        warmup_active = True
                 if (now >= start) and (now < end):
                     active = True
-                    runtime_start = start
-                    runtime_end = end
     elif enabled:
         active = True
         runtime_start = config.activated_at
@@ -360,6 +367,9 @@ def _resolve_flash_sale_runtime(config: FlashSaleConfig | None, now: datetime) -
         "schedule_days": config.schedule_days,
         "schedule_start_time": config.schedule_start_time,
         "schedule_end_time": config.schedule_end_time,
+        "warmup_minutes": warmup_minutes,
+        "warmup_active": warmup_active,
+        "warmup_start_at": warmup_start.isoformat() if warmup_start else None,
         "runtime_start_at": runtime_start.isoformat() if runtime_start else None,
         "runtime_end_at": runtime_end.isoformat() if runtime_end else None,
         "countdown_end_at": countdown_end.isoformat() if countdown_end else None,
@@ -402,6 +412,7 @@ def _apply_flash_sale_preload_guard(db: Session, device: Device, runtime: dict |
     progress_percent = int(sync_status.get("progress_percent", 0) or 0)
 
     runtime_active = bool(enriched.get("active"))
+    warmup_active = bool(enriched.get("warmup_active"))
     enabled = bool(enriched.get("enabled"))
 
     # Countdown gate: campaign can be enabled/active by schedule, but display waits
@@ -418,6 +429,10 @@ def _apply_flash_sale_preload_guard(db: Session, device: Device, runtime: dict |
         runtime_state = "blocked"
         display_active = False
         guard_reason = "no_products"
+    elif warmup_active and len(missing_ids) > 0:
+        runtime_state = "warmup"
+        display_active = False
+        guard_reason = "warmup_preloading"
     elif len(missing_ids) == 0:
         runtime_state = "live"
         display_active = True

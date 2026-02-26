@@ -2,6 +2,19 @@
 
 All notable changes to this project are documented in this file.
 
+## [1.0.6] - 2026-02-26
+
+### Added
+- Added Flash Sale preflight simulator endpoint:
+  - `GET /flash-sale/device/{device_id}/preflight`
+  - Returns missing media IDs, missing bytes, ETA estimate, and recommended warmup minutes.
+
+### Changed
+- Added `warmup_minutes` support in Flash Sale config (`now` and `schedule` endpoints).
+- Flash Sale runtime now exposes warmup fields in device config:
+  - `warmup_minutes`, `warmup_active`, `warmup_start_at`
+- Flash Sale preload guard now uses `runtime_state="warmup"` with `guard_reason="warmup_preloading"` when campaign is in warmup window and media is still missing.
+
 ## [1.0.3] - 2026-02-17
 
 ### Added

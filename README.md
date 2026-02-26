@@ -102,6 +102,7 @@ Open docs:
 - `POST /devices/{device_id}/sync-ack`
 - `PUT /flash-sale/device/{device_id}/now`
 - `PUT /flash-sale/device/{device_id}/schedule`
+- `GET /flash-sale/device/{device_id}/preflight`
 - `DELETE /flash-sale/device/{device_id}`
 - `GET /screens?device_id=<device_id>`
 - `PUT /screens/{screen_id}?grid_preset=2x2&transition_duration_sec=2`
@@ -226,9 +227,11 @@ function renderDeviceBadge(device) {
 - Campaign payload supports:
   - `note` (running text)
   - `countdown_sec`
+  - `warmup_minutes` (pre-download window before scheduled start)
   - `products_json` (must include `media_id` per product)
   - optional schedule (`schedule_days`, `start_time`, `end_time`)
 - Runtime status is exposed in `GET /devices/{device_id}/config` under top-level `flash_sale`.
+- Preflight simulator is available via `GET /flash-sale/device/{device_id}/preflight` to estimate missing bytes, ETA, and recommended warmup minutes.
 
 ## VS Code Setup
 - Open folder: `D:\APP Video Promosi\app`
