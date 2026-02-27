@@ -199,8 +199,16 @@ def ensure_sqlite_schema():
         if flash_sale_exists:
             flash_sale_cols = conn.execute(text("PRAGMA table_info(flash_sale_config)")).fetchall()
             flash_sale_col_names = {row[1] for row in flash_sale_cols}
+            if "is_draft" not in flash_sale_col_names:
+                conn.execute(text("ALTER TABLE flash_sale_config ADD COLUMN is_draft INTEGER DEFAULT 0"))
             if "warmup_minutes" not in flash_sale_col_names:
                 conn.execute(text("ALTER TABLE flash_sale_config ADD COLUMN warmup_minutes INTEGER"))
+            conn.execute(
+                text(
+                    "UPDATE flash_sale_config SET is_draft=0 "
+                    "WHERE is_draft IS NULL"
+                )
+            )
             conn.execute(
                 text(
                     "UPDATE flash_sale_config SET warmup_minutes=NULL "

@@ -145,6 +145,42 @@ def _find_or_create_config(db: Session, device_id: str) -> FlashSaleConfig:
     return config
 
 
+def _apply_schedule_fields(
+    config: FlashSaleConfig,
+    *,
+    schedule_days: str | None,
+    start_time: str | None,
+    end_time: str | None,
+    require_all: bool,
+) -> None:
+    has_days = bool((schedule_days or "").strip())
+    has_start = bool((start_time or "").strip())
+    has_end = bool((end_time or "").strip())
+    any_schedule = has_days or has_start or has_end
+
+    if require_all and not (has_days and has_start and has_end):
+        raise HTTPException(
+            status_code=400,
+            detail="schedule_days, start_time, end_time are required",
+        )
+
+    if any_schedule and not (has_days and has_start and has_end):
+        raise HTTPException(
+            status_code=400,
+            detail="schedule_days, start_time, end_time must be sent together",
+        )
+
+    if not any_schedule:
+        config.schedule_days = None
+        config.schedule_start_time = None
+        config.schedule_end_time = None
+        return
+
+    config.schedule_days = _normalize_schedule_days(schedule_days or "")
+    config.schedule_start_time = _normalize_time_hms(start_time or "")
+    config.schedule_end_time = _normalize_time_hms(end_time or "")
+
+
 def _parse_cached_media_ids(csv: str | None) -> set[str]:
     output: set[str] = set()
     for item in (csv or "").split(","):
@@ -178,6 +214,7 @@ def get_flash_sale(device_id: str, db: Session = Depends(get_db)):
         "device_id": device_id,
         "flash_sale": {
             "enabled": bool(config.enabled),
+            "is_draft": bool(config.is_draft),
             "note": config.note,
             "countdown_sec": config.countdown_sec,
             "products_json": config.products_json,
@@ -203,13 +240,18 @@ def upsert_flash_sale_now(
     _find_device_or_404(db, device_id)
     config = _find_or_create_config(db, device_id)
     config.enabled = True
+    config.is_draft = False
     config.note = (note or "").strip() or None
     config.countdown_sec = _normalize_countdown(countdown_sec)
     config.warmup_minutes = _normalize_warmup_minutes(warmup_minutes)
     config.products_json = _normalize_products_json(products_json, db)
-    config.schedule_days = None
-    config.schedule_start_time = None
-    config.schedule_end_time = None
+    _apply_schedule_fields(
+        config,
+        schedule_days=None,
+        start_time=None,
+        end_time=None,
+        require_all=False,
+    )
     config.activated_at = datetime.utcnow()
     config.updated_at = datetime.utcnow()
     db.commit()
@@ -232,14 +274,53 @@ def upsert_flash_sale_schedule(
     _find_device_or_404(db, device_id)
     config = _find_or_create_config(db, device_id)
     config.enabled = True
+    config.is_draft = False
     config.note = (note or "").strip() or None
     config.countdown_sec = _normalize_countdown(countdown_sec)
     config.warmup_minutes = _normalize_warmup_minutes(warmup_minutes)
     config.products_json = _normalize_products_json(products_json, db)
-    config.schedule_days = _normalize_schedule_days(schedule_days or "")
-    config.schedule_start_time = _normalize_time_hms(start_time or "")
-    config.schedule_end_time = _normalize_time_hms(end_time or "")
+    _apply_schedule_fields(
+        config,
+        schedule_days=schedule_days,
+        start_time=start_time,
+        end_time=end_time,
+        require_all=True,
+    )
     config.activated_at = datetime.utcnow()
+    config.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(config)
+    return {"ok": True, "device_id": device_id}
+
+
+@router.put("/device/{device_id}/draft")
+def upsert_flash_sale_draft(
+    device_id: str,
+    note: str | None = None,
+    countdown_sec: int | None = None,
+    warmup_minutes: int | None = None,
+    products_json: str | None = None,
+    schedule_days: str | None = None,
+    start_time: str | None = None,
+    end_time: str | None = None,
+    db: Session = Depends(get_db),
+):
+    _find_device_or_404(db, device_id)
+    config = _find_or_create_config(db, device_id)
+    config.enabled = False
+    config.is_draft = True
+    config.note = (note or "").strip() or None
+    config.countdown_sec = _normalize_countdown(countdown_sec)
+    config.warmup_minutes = _normalize_warmup_minutes(warmup_minutes)
+    config.products_json = _normalize_products_json(products_json, db)
+    _apply_schedule_fields(
+        config,
+        schedule_days=schedule_days,
+        start_time=start_time,
+        end_time=end_time,
+        require_all=False,
+    )
+    config.activated_at = None
     config.updated_at = datetime.utcnow()
     db.commit()
     db.refresh(config)
@@ -319,6 +400,7 @@ def disable_flash_sale(device_id: str, db: Session = Depends(get_db)):
     if not config:
         return {"ok": True, "device_id": device_id}
     config.enabled = False
+    config.is_draft = False
     config.updated_at = datetime.utcnow()
     db.commit()
     return {"ok": True, "device_id": device_id}

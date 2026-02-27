@@ -12,6 +12,7 @@ from app.models.playlist import Playlist, PlaylistItem
 from app.models.media import Media
 from app.schemas.device import DeviceRegisterIn
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 router = APIRouter(prefix="/devices", tags=["devices"])
 DEVICE_OFFLINE_AFTER_SEC = int(os.getenv("SIGNAGE_DEVICE_OFFLINE_AFTER_SEC", "70"))
@@ -24,6 +25,18 @@ DOWNLOAD_CONNECT_TIMEOUT_SEC = int(os.getenv("SIGNAGE_DOWNLOAD_CONNECT_TIMEOUT_S
 DOWNLOAD_READ_TIMEOUT_SEC = int(os.getenv("SIGNAGE_DOWNLOAD_READ_TIMEOUT_SEC", "60"))
 DOWNLOAD_PRIMARY_BASE_URL = (os.getenv("SIGNAGE_DOWNLOAD_BASE_URL", "") or "").strip().rstrip("/")
 DOWNLOAD_MIRROR_BASE_URL = (os.getenv("SIGNAGE_DOWNLOAD_MIRROR_URL", "") or "").strip().rstrip("/")
+FLASH_SALE_TIMEZONE = (os.getenv("SIGNAGE_FLASH_SALE_TIMEZONE", "Asia/Jakarta") or "").strip()
+try:
+    _FLASH_SALE_TZ = ZoneInfo(FLASH_SALE_TIMEZONE) if FLASH_SALE_TIMEZONE else None
+except Exception:
+    _FLASH_SALE_TZ = None
+
+
+def _flash_sale_now() -> datetime:
+    if _FLASH_SALE_TZ is None:
+        return datetime.now()
+    # Return naive local-time wall clock to stay compatible with existing DB values.
+    return datetime.now(_FLASH_SALE_TZ).replace(tzinfo=None)
 
 def get_db():
     db = SessionLocal()
@@ -280,8 +293,13 @@ def _collect_required_media_ids(db: Session, device: Device) -> set[str]:
                 media_ids.add(str(it.media_id))
 
     flash_sale_config = db.query(FlashSaleConfig).filter(FlashSaleConfig.device_id == device.id).first()
-    flash_sale_runtime = _resolve_flash_sale_runtime(flash_sale_config, datetime.utcnow())
-    if flash_sale_runtime and flash_sale_runtime.get("products_json"):
+    flash_sale_runtime = _resolve_flash_sale_runtime(flash_sale_config, _flash_sale_now())
+    if (
+        flash_sale_runtime
+        and flash_sale_runtime.get("enabled")
+        and not flash_sale_runtime.get("is_draft")
+        and flash_sale_runtime.get("products_json")
+    ):
         try:
             rows = json.loads(flash_sale_runtime["products_json"])
             if isinstance(rows, list):
@@ -300,7 +318,8 @@ def _collect_required_media_ids(db: Session, device: Device) -> set[str]:
 def _resolve_flash_sale_runtime(config: FlashSaleConfig | None, now: datetime) -> dict | None:
     if not config:
         return None
-    enabled = bool(config.enabled)
+    is_draft = bool(getattr(config, "is_draft", False))
+    enabled = bool(config.enabled) and not is_draft
     countdown_sec = config.countdown_sec if (config.countdown_sec or 0) > 0 else None
     warmup_minutes = config.warmup_minutes if (config.warmup_minutes or 0) > 0 else None
     active = False
@@ -360,6 +379,8 @@ def _resolve_flash_sale_runtime(config: FlashSaleConfig | None, now: datetime) -
 
     return {
         "enabled": enabled,
+        "is_draft": is_draft,
+        "runtime_timezone": FLASH_SALE_TIMEZONE or "system_local",
         "active": active,
         "note": config.note,
         "countdown_sec": countdown_sec,
@@ -414,10 +435,15 @@ def _apply_flash_sale_preload_guard(db: Session, device: Device, runtime: dict |
     runtime_active = bool(enriched.get("active"))
     warmup_active = bool(enriched.get("warmup_active"))
     enabled = bool(enriched.get("enabled"))
+    is_draft = bool(enriched.get("is_draft"))
 
     # Countdown gate: campaign can be enabled/active by schedule, but display waits
     # until all flash-sale media (P0) are confirmed in cache.
-    if not enabled:
+    if is_draft:
+        runtime_state = "blocked"
+        display_active = False
+        guard_reason = "draft"
+    elif not enabled:
         runtime_state = "blocked"
         display_active = False
         guard_reason = "disabled"
@@ -484,7 +510,7 @@ def _schedule_start_datetime_for_day(base_day: datetime, value) -> datetime | No
 
 
 def _build_device_sync_plan(db: Session, device: Device) -> dict:
-    now = datetime.utcnow()
+    now = _flash_sale_now()
     flash_media_ids: set[str] = set()
     active_playlist_media_ids: set[str] = set()
     upcoming_playlist_media_ids: set[str] = set()
@@ -1479,7 +1505,7 @@ def device_config(device_id: str, request: Request, account_id: str | None = Non
     media = []
     flash_sale_runtime = None
     flash_sale_config = db.query(FlashSaleConfig).filter(FlashSaleConfig.device_id == device.id).first()
-    flash_sale_runtime = _resolve_flash_sale_runtime(flash_sale_config, datetime.utcnow())
+    flash_sale_runtime = _resolve_flash_sale_runtime(flash_sale_config, _flash_sale_now())
     flash_sale_runtime = _apply_flash_sale_preload_guard(db, device, flash_sale_runtime)
     if flash_sale_runtime and flash_sale_runtime.get("products_json"):
         try:

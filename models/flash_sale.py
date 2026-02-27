@@ -12,6 +12,7 @@ class FlashSaleConfig(Base):
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     device_id = Column(String(36), ForeignKey("device.id"), nullable=False, unique=True)
     enabled = Column(Boolean, nullable=False, default=True)
+    is_draft = Column(Boolean, nullable=False, default=False)
     note = Column(String, nullable=True)
     countdown_sec = Column(Integer, nullable=True)
     products_json = Column(String, nullable=True)
