@@ -23,6 +23,7 @@ DOWNLOAD_CHANNEL_MAX_PARALLEL = int(os.getenv("SIGNAGE_DOWNLOAD_MAX_PARALLEL", "
 DOWNLOAD_RETRY_MAX_ATTEMPTS = int(os.getenv("SIGNAGE_DOWNLOAD_RETRY_MAX_ATTEMPTS", "4"))
 DOWNLOAD_CONNECT_TIMEOUT_SEC = int(os.getenv("SIGNAGE_DOWNLOAD_CONNECT_TIMEOUT_SEC", "8"))
 DOWNLOAD_READ_TIMEOUT_SEC = int(os.getenv("SIGNAGE_DOWNLOAD_READ_TIMEOUT_SEC", "60"))
+SYNC_STUCK_RECOVER_SEC = int(os.getenv("SIGNAGE_SYNC_STUCK_RECOVER_SEC", "45"))
 DOWNLOAD_PRIMARY_BASE_URL = (os.getenv("SIGNAGE_DOWNLOAD_BASE_URL", "") or "").strip().rstrip("/")
 DOWNLOAD_MIRROR_BASE_URL = (os.getenv("SIGNAGE_DOWNLOAD_MIRROR_URL", "") or "").strip().rstrip("/")
 FLASH_SALE_TIMEZONE = (os.getenv("SIGNAGE_FLASH_SALE_TIMEZONE", "Asia/Jakarta") or "").strip()
@@ -775,6 +776,94 @@ def _device_sync_status_payload(db: Session, device_id: str) -> dict:
     }
 
 
+def _recover_stuck_sync_queue(
+    db: Session,
+    device: Device,
+    *,
+    trigger: str,
+    force: bool = False,
+) -> dict:
+    now = datetime.utcnow()
+    is_online = (
+        device.last_seen is not None
+        and (now - device.last_seen).total_seconds() <= DEVICE_OFFLINE_AFTER_SEC
+    )
+    cache_status = _compute_media_cache_status(db, device)
+    missing_count = int(cache_status.get("missing_count", 0) or 0)
+    sync_status = _device_sync_status_payload(db, str(device.id))
+    queue_status = str(sync_status.get("queue_status", "idle") or "idle").strip().lower()
+
+    if missing_count <= 0:
+        return {
+            "recovered": False,
+            "recover_reason": "no_missing_media",
+            "queue_status_before": queue_status,
+            "missing_count": missing_count,
+        }
+    if not is_online:
+        return {
+            "recovered": False,
+            "recover_reason": "device_offline",
+            "queue_status_before": queue_status,
+            "missing_count": missing_count,
+        }
+    if queue_status in {"queued", "downloading", "verifying"}:
+        return {
+            "recovered": False,
+            "recover_reason": "queue_active",
+            "queue_status_before": queue_status,
+            "missing_count": missing_count,
+        }
+
+    state = db.query(DeviceSyncState).filter(DeviceSyncState.device_id == str(device.id)).first()
+    report_age_sec = (
+        (now - state.last_report_at).total_seconds()
+        if state is not None and state.last_report_at is not None
+        else None
+    )
+    cache_age_sec = (
+        (now - device.media_cache_updated_at).total_seconds()
+        if device.media_cache_updated_at is not None
+        else None
+    )
+    stale = (
+        (report_age_sec is None or report_age_sec > SYNC_STUCK_RECOVER_SEC)
+        and (cache_age_sec is None or cache_age_sec > SYNC_STUCK_RECOVER_SEC)
+    )
+    if not force and not stale:
+        return {
+            "recovered": False,
+            "recover_reason": "not_stale_yet",
+            "queue_status_before": queue_status,
+            "missing_count": missing_count,
+            "report_age_sec": report_age_sec,
+            "cache_age_sec": cache_age_sec,
+        }
+
+    plan = _build_device_sync_plan(db, device)
+    summary = plan.get("summary", {}) if isinstance(plan.get("summary"), dict) else {}
+    download_count = int(summary.get("download_count", 0) or 0)
+    if download_count <= 0:
+        return {
+            "recovered": False,
+            "recover_reason": "no_download_items",
+            "queue_status_before": queue_status,
+            "missing_count": missing_count,
+        }
+
+    persisted = _persist_device_sync_plan(db, str(device.id), plan)
+    return {
+        "recovered": True,
+        "recover_reason": "manual_force" if force else "stuck_timeout",
+        "queue_status_before": queue_status,
+        "queue_status_after": str(persisted.get("queue_status") or plan.get("queue_status") or "queued"),
+        "missing_count": missing_count,
+        "download_count": download_count,
+        "plan_revision": plan.get("plan_revision"),
+        "trigger": trigger,
+    }
+
+
 def _summarize_sync_items(db: Session, device_id: str, plan_revision: str) -> dict:
     rows = (
         db.query(DeviceSyncItem.status, DeviceSyncItem.priority)
@@ -891,12 +980,23 @@ def request_media_download(
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
     _enforce_device_owner(device, _resolve_account_id(request, account_id))
+    recovery = _recover_stuck_sync_queue(
+        db,
+        device,
+        trigger="request_media_download",
+        force=True,
+    )
 
     return {
         "ok": True,
         "device_id": str(device.id),
         "accepted_at": datetime.utcnow().isoformat(),
-        "hint": "Permintaan diterima. Player akan sinkron saat menerima event config_changed/polling berikutnya.",
+        "hint": (
+            "Permintaan diterima. Queue sync diregenerate karena media masih missing."
+            if recovery.get("recovered")
+            else "Permintaan diterima. Player akan sinkron saat polling berikutnya."
+        ),
+        "recovery": recovery,
     }
 
 
@@ -1104,8 +1204,15 @@ def device_sync_status(
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
     _enforce_device_owner(device, _resolve_account_id(request, account_id))
+    recovery = _recover_stuck_sync_queue(
+        db,
+        device,
+        trigger="sync_status_poll",
+        force=False,
+    )
     return {
         "device_id": str(device.id),
+        "stuck_recovery": recovery,
         **_device_sync_status_payload(db, str(device.id)),
     }
 
