@@ -57,6 +57,15 @@ def _normalize_time_hms(value: str) -> str:
     return f"{hour:02d}:{minute:02d}:{second:02d}"
 
 
+def _normalize_date_ymd(value: str) -> str:
+    raw = (value or "").strip()
+    try:
+        parsed = datetime.strptime(raw, "%Y-%m-%d")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Date must be YYYY-MM-DD") from exc
+    return parsed.strftime("%Y-%m-%d")
+
+
 def _normalize_schedule_days(values: str) -> str:
     raw = (values or "").strip()
     if not raw:
@@ -149,34 +158,61 @@ def _apply_schedule_fields(
     config: FlashSaleConfig,
     *,
     schedule_days: str | None,
+    start_date: str | None,
+    end_date: str | None,
     start_time: str | None,
     end_time: str | None,
     require_all: bool,
 ) -> None:
     has_days = bool((schedule_days or "").strip())
+    has_start_date = bool((start_date or "").strip())
+    has_end_date = bool((end_date or "").strip())
     has_start = bool((start_time or "").strip())
     has_end = bool((end_time or "").strip())
-    any_schedule = has_days or has_start or has_end
+    any_schedule = has_days or has_start_date or has_end_date or has_start or has_end
 
-    if require_all and not (has_days and has_start and has_end):
+    if require_all and not (has_start and has_end and (has_days or (has_start_date and has_end_date))):
         raise HTTPException(
             status_code=400,
-            detail="schedule_days, start_time, end_time are required",
+            detail="start_time, end_time and (schedule_days or start_date+end_date) are required",
         )
 
-    if any_schedule and not (has_days and has_start and has_end):
+    if has_start_date != has_end_date:
         raise HTTPException(
             status_code=400,
-            detail="schedule_days, start_time, end_time must be sent together",
+            detail="start_date and end_date must be sent together",
+        )
+
+    if any_schedule and not (has_start and has_end):
+        raise HTTPException(
+            status_code=400,
+            detail="start_time and end_time must be sent together",
+        )
+
+    if any_schedule and not (has_days or (has_start_date and has_end_date)):
+        raise HTTPException(
+            status_code=400,
+            detail="schedule requires schedule_days or start_date+end_date",
         )
 
     if not any_schedule:
         config.schedule_days = None
+        config.schedule_start_date = None
+        config.schedule_end_date = None
         config.schedule_start_time = None
         config.schedule_end_time = None
         return
 
-    config.schedule_days = _normalize_schedule_days(schedule_days or "")
+    normalized_start_date = None
+    normalized_end_date = None
+    if has_start_date and has_end_date:
+        normalized_start_date = _normalize_date_ymd(start_date or "")
+        normalized_end_date = _normalize_date_ymd(end_date or "")
+        if normalized_end_date < normalized_start_date:
+            raise HTTPException(status_code=400, detail="end_date must be >= start_date")
+    config.schedule_days = _normalize_schedule_days(schedule_days or "") if has_days else None
+    config.schedule_start_date = normalized_start_date
+    config.schedule_end_date = normalized_end_date
     config.schedule_start_time = _normalize_time_hms(start_time or "")
     config.schedule_end_time = _normalize_time_hms(end_time or "")
 
@@ -219,6 +255,8 @@ def get_flash_sale(device_id: str, db: Session = Depends(get_db)):
             "countdown_sec": config.countdown_sec,
             "products_json": config.products_json,
             "schedule_days": config.schedule_days,
+            "schedule_start_date": config.schedule_start_date,
+            "schedule_end_date": config.schedule_end_date,
             "schedule_start_time": config.schedule_start_time,
             "schedule_end_time": config.schedule_end_time,
             "warmup_minutes": config.warmup_minutes,
@@ -248,6 +286,8 @@ def upsert_flash_sale_now(
     _apply_schedule_fields(
         config,
         schedule_days=None,
+        start_date=None,
+        end_date=None,
         start_time=None,
         end_time=None,
         require_all=False,
@@ -267,6 +307,8 @@ def upsert_flash_sale_schedule(
     warmup_minutes: int | None = None,
     products_json: str | None = None,
     schedule_days: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
     start_time: str | None = None,
     end_time: str | None = None,
     db: Session = Depends(get_db),
@@ -282,6 +324,8 @@ def upsert_flash_sale_schedule(
     _apply_schedule_fields(
         config,
         schedule_days=schedule_days,
+        start_date=start_date,
+        end_date=end_date,
         start_time=start_time,
         end_time=end_time,
         require_all=True,
@@ -301,6 +345,8 @@ def upsert_flash_sale_draft(
     warmup_minutes: int | None = None,
     products_json: str | None = None,
     schedule_days: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
     start_time: str | None = None,
     end_time: str | None = None,
     db: Session = Depends(get_db),
@@ -316,6 +362,8 @@ def upsert_flash_sale_draft(
     _apply_schedule_fields(
         config,
         schedule_days=schedule_days,
+        start_date=start_date,
+        end_date=end_date,
         start_time=start_time,
         end_time=end_time,
         require_all=False,
@@ -404,3 +452,14 @@ def disable_flash_sale(device_id: str, db: Session = Depends(get_db)):
     config.updated_at = datetime.utcnow()
     db.commit()
     return {"ok": True, "device_id": device_id}
+
+
+@router.delete("/device/{device_id}/clear")
+def clear_flash_sale(device_id: str, db: Session = Depends(get_db)):
+    _find_device_or_404(db, device_id)
+    config = db.query(FlashSaleConfig).filter(FlashSaleConfig.device_id == device_id).first()
+    if not config:
+        return {"ok": True, "device_id": device_id, "cleared": False}
+    db.delete(config)
+    db.commit()
+    return {"ok": True, "device_id": device_id, "cleared": True}

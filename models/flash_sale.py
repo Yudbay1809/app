@@ -17,6 +17,8 @@ class FlashSaleConfig(Base):
     countdown_sec = Column(Integer, nullable=True)
     products_json = Column(String, nullable=True)
     schedule_days = Column(String, nullable=True)  # CSV: 0,1,2,3,4,5,6
+    schedule_start_date = Column(String, nullable=True)  # YYYY-MM-DD
+    schedule_end_date = Column(String, nullable=True)  # YYYY-MM-DD
     schedule_start_time = Column(String, nullable=True)  # HH:MM:SS
     schedule_end_time = Column(String, nullable=True)  # HH:MM:SS
     warmup_minutes = Column(Integer, nullable=True)  # pre-download window before schedule starts

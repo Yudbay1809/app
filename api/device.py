@@ -378,6 +378,13 @@ def _parse_cached_media_ids(csv: str | None) -> set[str]:
     return output
 
 
+def _normalize_media_quality_tier(value: str | None) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in {"low", "normal", "high"}:
+        return normalized
+    return "normal"
+
+
 def _download_status_presentation(download_status: str) -> tuple[str, str]:
     mapping = {
         "completed": ("Selesai", "#16A34A"),
@@ -434,7 +441,16 @@ def _download_overview(sync_status: dict, media_cache_status: dict) -> dict:
 
 def _compute_media_cache_status(db: Session, device: Device) -> dict:
     required_ids = _collect_required_media_ids(db, device)
-    cached_ids = _parse_cached_media_ids(device.cached_media_ids)
+    quality_tier = _normalize_media_quality_tier(getattr(device, "media_quality_tier", "normal"))
+    normal_ids = _parse_cached_media_ids(device.cached_media_ids)
+    low_ids = _parse_cached_media_ids(getattr(device, "cached_media_low_ids", None))
+    if not low_ids:
+        low_ids = set(normal_ids)
+    if quality_tier == "low":
+        cached_ids = set(low_ids)
+    else:
+        # normal/high readiness tetap minimal tier normal agar tidak menunggu high tanpa batas.
+        cached_ids = set(normal_ids)
     missing_ids = sorted(required_ids - cached_ids)
     extra_ids = sorted(cached_ids - required_ids)
     has_report = device.media_cache_updated_at is not None
@@ -461,6 +477,7 @@ def _compute_media_cache_status(db: Session, device: Device) -> dict:
         "missing_media_ids": missing_ids,
         "extra_cached_media_ids": extra_ids,
         "cache_updated_at": device.media_cache_updated_at.isoformat() if device.media_cache_updated_at else None,
+        "target_quality_tier": quality_tier,
     }
 
 
@@ -604,8 +621,13 @@ def _resolve_flash_sale_runtime(config: FlashSaleConfig | None, now: datetime) -
     countdown_end: datetime | None = None
     now_utc = datetime.utcnow()
 
+    has_schedule_days = bool((config.schedule_days or "").strip())
+    has_schedule_dates = bool(
+        (config.schedule_start_date or "").strip()
+        and (config.schedule_end_date or "").strip()
+    )
     has_schedule = bool(
-        (config.schedule_days or "").strip()
+        (has_schedule_days or has_schedule_dates)
         and (config.schedule_start_time or "").strip()
         and (config.schedule_end_time or "").strip()
     )
@@ -613,33 +635,41 @@ def _resolve_flash_sale_runtime(config: FlashSaleConfig | None, now: datetime) -
 
     if enabled and has_schedule:
         allowed_days: set[int] = set()
-        for item in (config.schedule_days or "").split(","):
-            value = item.strip()
-            if not value:
-                continue
-            try:
-                day = int(value)
-            except ValueError:
-                continue
-            if 0 <= day <= 6:
-                allowed_days.add(day)
+        if has_schedule_days:
+            for item in (config.schedule_days or "").split(","):
+                value = item.strip()
+                if not value:
+                    continue
+                try:
+                    day = int(value)
+                except ValueError:
+                    continue
+                if 0 <= day <= 6:
+                    allowed_days.add(day)
         hms_start = _parse_hms(config.schedule_start_time or "")
         hms_end = _parse_hms(config.schedule_end_time or "")
-        if allowed_days and hms_start and hms_end:
-            now_day = now.weekday() % 7
-            if now_day in allowed_days:
-                start = datetime(now.year, now.month, now.day, hms_start[0], hms_start[1], hms_start[2])
-                end = datetime(now.year, now.month, now.day, hms_end[0], hms_end[1], hms_end[2])
-                if end <= start:
-                    end = end + timedelta(days=1)
-                runtime_start = start
-                runtime_end = end
-                if warmup_minutes is not None:
-                    warmup_start = start - timedelta(minutes=warmup_minutes)
-                    if warmup_start <= now < start:
-                        warmup_active = True
-                if (now >= start) and (now < end):
-                    active = True
+        in_date_range = True
+        if has_schedule_dates:
+            try:
+                start_date = datetime.strptime(config.schedule_start_date or "", "%Y-%m-%d").date()
+                end_date = datetime.strptime(config.schedule_end_date or "", "%Y-%m-%d").date()
+                in_date_range = start_date <= now.date() <= end_date
+            except ValueError:
+                in_date_range = False
+        allow_today = in_date_range and ((not has_schedule_days) or ((now.weekday() % 7) in allowed_days))
+        if allow_today and hms_start and hms_end:
+            start = datetime(now.year, now.month, now.day, hms_start[0], hms_start[1], hms_start[2])
+            end = datetime(now.year, now.month, now.day, hms_end[0], hms_end[1], hms_end[2])
+            if end <= start:
+                end = end + timedelta(days=1)
+            runtime_start = start
+            runtime_end = end
+            if warmup_minutes is not None:
+                warmup_start = start - timedelta(minutes=warmup_minutes)
+                if warmup_start <= now < start:
+                    warmup_active = True
+            if (now >= start) and (now < end):
+                active = True
     elif enabled:
         active = True
         # For "now" mode, keep UTC naive timeline consistent with persisted activated_at.
@@ -666,6 +696,8 @@ def _resolve_flash_sale_runtime(config: FlashSaleConfig | None, now: datetime) -
         "countdown_sec": countdown_sec,
         "products_json": config.products_json,
         "schedule_days": config.schedule_days,
+        "schedule_start_date": config.schedule_start_date,
+        "schedule_end_date": config.schedule_end_date,
         "schedule_start_time": config.schedule_start_time,
         "schedule_end_time": config.schedule_end_time,
         "warmup_minutes": warmup_minutes,
@@ -1075,6 +1107,20 @@ def _recover_stuck_sync_queue(
     missing_count = int(cache_status.get("missing_count", 0) or 0)
     sync_status = _device_sync_status_payload(db, str(device.id))
     queue_status = str(sync_status.get("queue_status", "idle") or "idle").strip().lower()
+    state = db.query(DeviceSyncState).filter(DeviceSyncState.device_id == str(device.id)).first()
+    report_age_sec = (
+        (now - state.last_report_at).total_seconds()
+        if state is not None and state.last_report_at is not None
+        else None
+    )
+    cache_age_sec = (
+        (now - device.media_cache_updated_at).total_seconds()
+        if device.media_cache_updated_at is not None
+        else None
+    )
+    report_stale = report_age_sec is None or report_age_sec > SYNC_STUCK_RECOVER_SEC
+    cache_stale = cache_age_sec is None or cache_age_sec > SYNC_STUCK_RECOVER_SEC
+    stale = report_stale and cache_stale
 
     if missing_count <= 0:
         return {
@@ -1091,28 +1137,20 @@ def _recover_stuck_sync_queue(
             "missing_count": missing_count,
         }
     if queue_status in {"queued", "downloading", "verifying"}:
-        return {
-            "recovered": False,
-            "recover_reason": "queue_active",
-            "queue_status_before": queue_status,
-            "missing_count": missing_count,
-        }
+        # Queue bisa macet (queued lama tanpa progress). Untuk manual force,
+        # izinkan regenerate bila report progress sudah stale.
+        if force and report_stale:
+            pass
+        else:
+            return {
+                "recovered": False,
+                "recover_reason": "queue_active",
+                "queue_status_before": queue_status,
+                "missing_count": missing_count,
+                "report_age_sec": report_age_sec,
+                "cache_age_sec": cache_age_sec,
+            }
 
-    state = db.query(DeviceSyncState).filter(DeviceSyncState.device_id == str(device.id)).first()
-    report_age_sec = (
-        (now - state.last_report_at).total_seconds()
-        if state is not None and state.last_report_at is not None
-        else None
-    )
-    cache_age_sec = (
-        (now - device.media_cache_updated_at).total_seconds()
-        if device.media_cache_updated_at is not None
-        else None
-    )
-    stale = (
-        (report_age_sec is None or report_age_sec > SYNC_STUCK_RECOVER_SEC)
-        and (cache_age_sec is None or cache_age_sec > SYNC_STUCK_RECOVER_SEC)
-    )
     if not force and not stale:
         return {
             "recovered": False,
@@ -1717,6 +1755,7 @@ def register_device(
     name: str | None = None,
     location: str = "",
     orientation: str = "portrait",
+    media_quality_tier: str = "normal",
     account_id: str | None = None,
     db: Session = Depends(get_db),
 ):
@@ -1724,10 +1763,13 @@ def register_device(
         name = payload.name
         location = payload.location
         orientation = payload.orientation
+        media_quality_tier = payload.media_quality_tier
         account_id = payload.account_id
 
     if not name:
         raise HTTPException(status_code=422, detail="Missing device name")
+
+    media_quality_tier = _normalize_media_quality_tier(media_quality_tier)
 
     resolved_account = _resolve_account_id(request, account_id)
     client_ip = _resolve_client_ip(request)
@@ -1742,6 +1784,7 @@ def register_device(
         existing.name = name
         existing.location = location
         existing.orientation = orientation
+        existing.media_quality_tier = media_quality_tier
         existing.last_seen = datetime.utcnow()
         existing.status = "online"
         _assign_unique_client_ip(db, existing, client_ip)
@@ -1756,6 +1799,7 @@ def register_device(
             "last_seen": existing.last_seen,
             "status": existing.status,
             "orientation": existing.orientation,
+            "media_quality_tier": _normalize_media_quality_tier(existing.media_quality_tier),
             "owner_account": existing.owner_account,
         }
 
@@ -1768,6 +1812,7 @@ def register_device(
         last_seen=datetime.utcnow(),
         status="online",
         orientation=orientation,
+        media_quality_tier=media_quality_tier,
     )
     db.add(device)
     db.commit()
@@ -1788,6 +1833,7 @@ def register_device(
         "last_seen": device.last_seen,
         "status": device.status,
         "orientation": device.orientation,
+        "media_quality_tier": _normalize_media_quality_tier(device.media_quality_tier),
         "owner_account": device.owner_account,
     }
 
@@ -1841,6 +1887,7 @@ def list_devices(request: Request, account_id: str | None = None, db: Session = 
                 "last_seen": d.last_seen,
                 "status": d.status,
                 "orientation": d.orientation,
+                "media_quality_tier": _normalize_media_quality_tier(d.media_quality_tier),
                 "owner_account": d.owner_account,
                 "media_download_ready": media_cache_status["ready"],
                 "media_download_status": media_cache_status["download_status"],
@@ -1877,6 +1924,7 @@ def update_device(
     device_id: str,
     request: Request,
     orientation: str | None = None,
+    media_quality_tier: str | None = None,
     account_id: str | None = None,
     db: Session = Depends(get_db),
 ):
@@ -1889,7 +1937,8 @@ def update_device(
         device.owner_account = resolved_account
     if orientation is not None:
         device.orientation = orientation
-    _assign_unique_client_ip(db, device, _resolve_client_ip(request))
+    if media_quality_tier is not None:
+        device.media_quality_tier = _normalize_media_quality_tier(media_quality_tier)
     db.commit()
     db.refresh(device)
     return {
@@ -1901,6 +1950,7 @@ def update_device(
         "last_seen": device.last_seen,
         "status": device.status,
         "orientation": device.orientation,
+        "media_quality_tier": _normalize_media_quality_tier(device.media_quality_tier),
         "owner_account": device.owner_account,
     }
 
@@ -2043,6 +2093,7 @@ def device_config(device_id: str, request: Request, account_id: str | None = Non
             "name": device.name,
             "location": device.location,
             "orientation": device.orientation,
+            "media_quality_tier": _normalize_media_quality_tier(device.media_quality_tier),
             "owner_account": device.owner_account,
         },
         "screens": [

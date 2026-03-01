@@ -5,6 +5,7 @@ class DeviceRegisterIn(BaseModel):
     name: str = Field(..., min_length=1)
     location: str = ""
     orientation: str = "portrait"
+    media_quality_tier: str = "normal"
     account_id: str | None = None
 
 class DeviceOut(BaseModel):
@@ -16,6 +17,7 @@ class DeviceOut(BaseModel):
     last_seen: datetime | None = None
     status: str
     orientation: str | None = None
+    media_quality_tier: str | None = None
     owner_account: str | None = None
 
     class Config:

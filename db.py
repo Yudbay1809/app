@@ -27,6 +27,8 @@ def ensure_sqlite_schema():
         col_names = {row[1] for row in cols}  # (cid, name, type, notnull, dflt_value, pk)
         if "orientation" not in col_names:
             conn.execute(text("ALTER TABLE device ADD COLUMN orientation VARCHAR DEFAULT 'portrait'"))
+        if "media_quality_tier" not in col_names:
+            conn.execute(text("ALTER TABLE device ADD COLUMN media_quality_tier VARCHAR DEFAULT 'normal'"))
         if "owner_account" not in col_names:
             conn.execute(text("ALTER TABLE device ADD COLUMN owner_account VARCHAR"))
         if "legacy_id" not in col_names:
@@ -73,6 +75,13 @@ def ensure_sqlite_schema():
 
         if "orientation" in col_names or cols:
             conn.execute(text("UPDATE device SET orientation='portrait' WHERE orientation IS NULL OR orientation=''"))
+        conn.execute(
+            text(
+                "UPDATE device SET media_quality_tier='normal' "
+                "WHERE media_quality_tier IS NULL OR trim(media_quality_tier)='' "
+                "OR lower(trim(media_quality_tier)) NOT IN ('low','normal','high')"
+            )
+        )
 
         device_rows = conn.execute(text("SELECT id FROM device ORDER BY rowid ASC")).fetchall()
         id_values = [row[0] for row in device_rows if row and row[0]]
@@ -207,6 +216,10 @@ def ensure_sqlite_schema():
                 conn.execute(text("ALTER TABLE flash_sale_config ADD COLUMN is_draft INTEGER DEFAULT 0"))
             if "warmup_minutes" not in flash_sale_col_names:
                 conn.execute(text("ALTER TABLE flash_sale_config ADD COLUMN warmup_minutes INTEGER"))
+            if "schedule_start_date" not in flash_sale_col_names:
+                conn.execute(text("ALTER TABLE flash_sale_config ADD COLUMN schedule_start_date VARCHAR"))
+            if "schedule_end_date" not in flash_sale_col_names:
+                conn.execute(text("ALTER TABLE flash_sale_config ADD COLUMN schedule_end_date VARCHAR"))
             conn.execute(
                 text(
                     "UPDATE flash_sale_config SET is_draft=0 "
@@ -217,6 +230,18 @@ def ensure_sqlite_schema():
                 text(
                     "UPDATE flash_sale_config SET warmup_minutes=NULL "
                     "WHERE warmup_minutes IS NOT NULL AND warmup_minutes <= 0"
+                )
+            )
+            conn.execute(
+                text(
+                    "UPDATE flash_sale_config SET schedule_start_date=NULL "
+                    "WHERE schedule_start_date IS NOT NULL AND trim(schedule_start_date)=''"
+                )
+            )
+            conn.execute(
+                text(
+                    "UPDATE flash_sale_config SET schedule_end_date=NULL "
+                    "WHERE schedule_end_date IS NOT NULL AND trim(schedule_end_date)=''"
                 )
             )
 

@@ -13,6 +13,14 @@ FastAPI backend for digital signage operations: media catalog, playlists, schedu
 - Validated with end-to-end API + websocket smoke tests before release.
 
 ## Latest Updates (2026-02-17)
+- Flash Sale schedule now supports date range (`start_date`, `end_date`) with `YYYY-MM-DD` format.
+  - Allows non-recurring campaign windows (example: only active between 2026-03-01 and 2026-03-03).
+  - Runtime activation checks date range + schedule time before marking campaign active.
+- Added hard delete endpoint for Flash Sale config:
+  - `DELETE /flash-sale/device/{device_id}/clear`
+  - This removes saved draft/runtime data completely (not just disable).
+- Existing disable endpoint remains:
+  - `DELETE /flash-sale/device/{device_id}` only sets `enabled=false` for current config.
 - Device media cache tracking added:
   - `POST /devices/{device_id}/media-cache-report`
   - `GET /devices/{device_id}/media-cache-status`
@@ -104,6 +112,7 @@ Open docs:
 - `PUT /flash-sale/device/{device_id}/schedule`
 - `GET /flash-sale/device/{device_id}/preflight`
 - `DELETE /flash-sale/device/{device_id}`
+- `DELETE /flash-sale/device/{device_id}/clear`
 - `GET /screens?device_id=<device_id>`
 - `PUT /screens/{screen_id}?grid_preset=2x2&transition_duration_sec=2`
 - `GET /media/page`
