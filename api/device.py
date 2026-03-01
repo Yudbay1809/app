@@ -1,5 +1,7 @@
 import json
 import os
+import hashlib
+import time
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 from app.db import SessionLocal
@@ -11,10 +13,16 @@ from app.models.schedule import Schedule
 from app.models.playlist import Playlist, PlaylistItem
 from app.models.media import Media
 from app.schemas.device import DeviceRegisterIn
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+try:
+    from PIL import Image
+    Image.MAX_IMAGE_PIXELS = None
+except Exception:  # pragma: no cover - optional dependency fallback
+    Image = None
 
 router = APIRouter(prefix="/devices", tags=["devices"])
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 DEVICE_OFFLINE_AFTER_SEC = int(os.getenv("SIGNAGE_DEVICE_OFFLINE_AFTER_SEC", "70"))
 DEFAULT_TRANSITION_DURATION_SEC = 1
 SYNC_PRELOAD_WINDOW_MIN = int(os.getenv("SIGNAGE_SYNC_PRELOAD_WINDOW_MIN", "30"))
@@ -24,6 +32,13 @@ DOWNLOAD_RETRY_MAX_ATTEMPTS = int(os.getenv("SIGNAGE_DOWNLOAD_RETRY_MAX_ATTEMPTS
 DOWNLOAD_CONNECT_TIMEOUT_SEC = int(os.getenv("SIGNAGE_DOWNLOAD_CONNECT_TIMEOUT_SEC", "8"))
 DOWNLOAD_READ_TIMEOUT_SEC = int(os.getenv("SIGNAGE_DOWNLOAD_READ_TIMEOUT_SEC", "60"))
 SYNC_STUCK_RECOVER_SEC = int(os.getenv("SIGNAGE_SYNC_STUCK_RECOVER_SEC", "45"))
+AUTO_COMPRESS_RETRY_THRESHOLD = int(os.getenv("SIGNAGE_AUTO_COMPRESS_RETRY_THRESHOLD", "3"))
+AUTO_COMPRESS_TARGET_IMAGE_BYTES = int(
+    os.getenv("SIGNAGE_AUTO_COMPRESS_TARGET_IMAGE_BYTES", str(5 * 1024 * 1024))
+)
+AUTO_COMPRESS_MIN_SOURCE_BYTES = int(
+    os.getenv("SIGNAGE_AUTO_COMPRESS_MIN_SOURCE_BYTES", str(2 * 1024 * 1024))
+)
 DOWNLOAD_PRIMARY_BASE_URL = (os.getenv("SIGNAGE_DOWNLOAD_BASE_URL", "") or "").strip().rstrip("/")
 DOWNLOAD_MIRROR_BASE_URL = (os.getenv("SIGNAGE_DOWNLOAD_MIRROR_URL", "") or "").strip().rstrip("/")
 FLASH_SALE_TIMEZONE = (os.getenv("SIGNAGE_FLASH_SALE_TIMEZONE", "Asia/Jakarta") or "").strip()
@@ -38,6 +53,19 @@ def _flash_sale_now() -> datetime:
         return datetime.now()
     # Return naive local-time wall clock to stay compatible with existing DB values.
     return datetime.now(_FLASH_SALE_TZ).replace(tzinfo=None)
+
+
+def _flash_sale_localize_activated_at(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if _FLASH_SALE_TZ is None:
+        return value
+    # `activated_at` historically stored as UTC naive datetime.
+    # Convert to configured runtime timezone wall clock before evaluating window/countdown.
+    try:
+        return value.replace(tzinfo=timezone.utc).astimezone(_FLASH_SALE_TZ).replace(tzinfo=None)
+    except Exception:
+        return value
 
 def get_db():
     db = SessionLocal()
@@ -91,6 +119,191 @@ def _download_base_urls(request: Request) -> list[str]:
     if DOWNLOAD_MIRROR_BASE_URL and DOWNLOAD_MIRROR_BASE_URL not in output:
         output.append(DOWNLOAD_MIRROR_BASE_URL)
     return output
+
+
+def _local_path_from_public_path(path: str) -> str:
+    cleaned = str(path or "").strip().replace("\\", "/")
+    if not cleaned:
+        return ""
+    relative = cleaned[1:] if cleaned.startswith("/") else cleaned
+    return os.path.abspath(os.path.join(PROJECT_ROOT, relative.replace("/", os.sep)))
+
+
+def _public_path_exists(path: str) -> bool:
+    try:
+        return os.path.isfile(_local_path_from_public_path(path))
+    except Exception:
+        return False
+
+
+def _media_variant_paths(media_row: Media) -> dict[str, str]:
+    base_path = str(media_row.path or "").strip()
+    if not base_path:
+        return {
+            "display_path": "",
+            "thumb_path": "",
+            "high_path": "",
+        }
+
+    display_path = base_path
+    thumb_path = base_path
+    high_path = base_path
+    media_type = str(media_row.type or "").strip().lower()
+    if media_type == "image":
+        normalized = base_path.replace("\\", "/")
+        if normalized.startswith("/"):
+            normalized = normalized[1:]
+        stem, ext = os.path.splitext(normalized)
+        stem_name = os.path.basename(stem)
+        candidates = [
+            f"/{stem}-thumb.webp",
+            f"/{stem}-thumb{ext}",
+            f"/storage/media/thumbs/{stem_name}.webp",
+        ]
+        for candidate in candidates:
+            if _public_path_exists(candidate):
+                thumb_path = candidate
+                break
+        high_candidates = [
+            f"/{stem}-high.webp",
+            f"/{stem}-high{ext}",
+            f"/storage/media/high/{stem_name}.webp",
+        ]
+        for candidate in high_candidates:
+            if _public_path_exists(candidate):
+                high_path = candidate
+                break
+
+    return {
+        "display_path": display_path,
+        "thumb_path": thumb_path,
+        "high_path": high_path,
+    }
+
+
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _auto_optimize_media_on_repeated_failure(
+    db: Session,
+    media_id: str,
+    *,
+    retry_count: int,
+    error: str,
+) -> dict:
+    if AUTO_COMPRESS_RETRY_THRESHOLD <= 0:
+        return {"optimized": False, "reason": "disabled"}
+    if retry_count < AUTO_COMPRESS_RETRY_THRESHOLD:
+        return {"optimized": False, "reason": "below_threshold"}
+    if Image is None:
+        return {"optimized": False, "reason": "pillow_not_available"}
+
+    media_row = db.query(Media).get(media_id)
+    if media_row is None:
+        return {"optimized": False, "reason": "media_not_found"}
+    if str(media_row.type or "").strip().lower() != "image":
+        return {"optimized": False, "reason": "not_image"}
+
+    current_public_path = str(media_row.path or "").strip()
+    current_fs_path = _local_path_from_public_path(current_public_path)
+    if not current_public_path or not os.path.isfile(current_fs_path):
+        return {"optimized": False, "reason": "source_missing"}
+
+    source_size = os.path.getsize(current_fs_path)
+    if source_size < AUTO_COMPRESS_MIN_SOURCE_BYTES:
+        return {"optimized": False, "reason": "source_already_small"}
+
+    stem, _ext = os.path.splitext(os.path.basename(current_fs_path))
+    if "-optimized-auto-" in stem:
+        return {"optimized": False, "reason": "already_auto_optimized"}
+
+    image = Image.open(current_fs_path)
+    if image.mode not in {"RGB", "RGBA"}:
+        if "A" in image.getbands():
+            image = image.convert("RGBA")
+        else:
+            image = image.convert("RGB")
+    resampling_ns = getattr(Image, "Resampling", None)
+    lanczos = resampling_ns.LANCZOS if resampling_ns is not None else Image.LANCZOS
+
+    base_w, base_h = image.size
+    width_scales = [1.0, 0.9, 0.8, 0.7, 0.6]
+    quality_steps = [82, 76, 70, 64, 58]
+
+    best_output_path = ""
+    best_size = 0
+    best_quality = 0
+    best_w = base_w
+    best_h = base_h
+
+    for scale in width_scales:
+        if scale == 1.0:
+            variant = image
+        else:
+            variant = image.resize(
+                (max(1, int(base_w * scale)), max(1, int(base_h * scale))),
+                lanczos,
+            )
+        for quality in quality_steps:
+            candidate_name = f"{stem}-optimized-auto-{int(time.time() * 1000)}.webp"
+            candidate_fs = os.path.join(os.path.dirname(current_fs_path), candidate_name)
+            variant.save(candidate_fs, format="WEBP", quality=quality, method=6)
+            candidate_size = os.path.getsize(candidate_fs)
+            if best_size == 0 or candidate_size < best_size:
+                if best_output_path and os.path.isfile(best_output_path):
+                    try:
+                        os.remove(best_output_path)
+                    except Exception:
+                        pass
+                best_output_path = candidate_fs
+                best_size = candidate_size
+                best_quality = quality
+                best_w, best_h = variant.size
+            else:
+                try:
+                    os.remove(candidate_fs)
+                except Exception:
+                    pass
+            if candidate_size <= AUTO_COMPRESS_TARGET_IMAGE_BYTES:
+                break
+        if best_size and best_size <= AUTO_COMPRESS_TARGET_IMAGE_BYTES:
+            break
+
+    if not best_output_path or not os.path.isfile(best_output_path):
+        return {"optimized": False, "reason": "optimize_failed"}
+
+    if best_size >= source_size:
+        try:
+            os.remove(best_output_path)
+        except Exception:
+            pass
+        return {"optimized": False, "reason": "not_smaller"}
+
+    new_public_path = f"/storage/media/{os.path.basename(best_output_path)}"
+    media_row.path = new_public_path
+    media_row.size = best_size
+    media_row.checksum = _sha256_file(best_output_path)
+
+    return {
+        "optimized": True,
+        "media_id": str(media_row.id),
+        "from_path": current_public_path,
+        "to_path": new_public_path,
+        "from_size": source_size,
+        "to_size": best_size,
+        "retry_count": retry_count,
+        "quality": best_quality,
+        "width": best_w,
+        "height": best_h,
+        "error": error,
+    }
 
 
 def _enforce_device_owner(device: Device, account_id: str | None) -> None:
@@ -251,6 +464,66 @@ def _compute_media_cache_status(db: Session, device: Device) -> dict:
     }
 
 
+def _compute_media_tier_status(db: Session, device: Device) -> dict:
+    required_ids = _collect_required_media_ids(db, device)
+    required_count = len(required_ids)
+    normal_ids = _parse_cached_media_ids(device.cached_media_ids)
+    low_ids = _parse_cached_media_ids(getattr(device, "cached_media_low_ids", None))
+    high_ids = _parse_cached_media_ids(getattr(device, "cached_media_high_ids", None))
+
+    # Backward compatibility: if low/high not reported yet, infer from normal cache.
+    if not low_ids:
+        low_ids = set(normal_ids)
+    if not high_ids:
+        high_ids = set()
+
+    low_ready_ids = required_ids.intersection(low_ids)
+    normal_ready_ids = required_ids.intersection(normal_ids)
+    high_ready_ids = required_ids.intersection(high_ids)
+
+    low_ready_count = len(low_ready_ids)
+    normal_ready_count = len(normal_ready_ids)
+    high_ready_count = len(high_ready_ids)
+
+    if required_count == 0:
+        tier_level = "no_content"
+        tier_label = "No Content"
+        tier_color = "#2563EB"
+    elif high_ready_count >= required_count:
+        tier_level = "high_ready"
+        tier_label = "HIGH Ready"
+        tier_color = "#7C3AED"
+    elif normal_ready_count >= required_count:
+        tier_level = "normal_ready"
+        tier_label = "NORMAL Ready"
+        tier_color = "#0EA5E9"
+    elif low_ready_count >= required_count:
+        tier_level = "low_ready"
+        tier_label = "LOW Ready"
+        tier_color = "#16A34A"
+    elif low_ready_count > 0:
+        tier_level = "low_partial"
+        tier_label = f"LOW Partial ({low_ready_count}/{required_count})"
+        tier_color = "#F59E0B"
+    else:
+        tier_level = "pending"
+        tier_label = "Pending"
+        tier_color = "#6B7280"
+
+    return {
+        "required_count": required_count,
+        "low_ready_count": low_ready_count,
+        "normal_ready_count": normal_ready_count,
+        "high_ready_count": high_ready_count,
+        "tier_level": tier_level,
+        "tier_label": tier_label,
+        "tier_color": tier_color,
+        "low_ready": required_count > 0 and low_ready_count >= required_count,
+        "normal_ready": required_count > 0 and normal_ready_count >= required_count,
+        "high_ready": required_count > 0 and high_ready_count >= required_count,
+    }
+
+
 def _collect_required_media_ids(db: Session, device: Device) -> set[str]:
     screens = db.query(Screen).filter(Screen.device_id == device.id).all()
     schedules = []
@@ -329,12 +602,15 @@ def _resolve_flash_sale_runtime(config: FlashSaleConfig | None, now: datetime) -
     runtime_end: datetime | None = None
     warmup_start: datetime | None = None
     countdown_end: datetime | None = None
+    now_utc = datetime.utcnow()
 
     has_schedule = bool(
         (config.schedule_days or "").strip()
         and (config.schedule_start_time or "").strip()
         and (config.schedule_end_time or "").strip()
     )
+    activated_at_local = _flash_sale_localize_activated_at(config.activated_at)
+
     if enabled and has_schedule:
         allowed_days: set[int] = set()
         for item in (config.schedule_days or "").split(","):
@@ -366,16 +642,19 @@ def _resolve_flash_sale_runtime(config: FlashSaleConfig | None, now: datetime) -
                     active = True
     elif enabled:
         active = True
-        runtime_start = config.activated_at
+        # For "now" mode, keep UTC naive timeline consistent with persisted activated_at.
+        runtime_start = config.activated_at or now_utc
 
     if countdown_sec is not None:
         if runtime_start is not None:
             countdown_end = runtime_start + timedelta(seconds=countdown_sec)
-        elif config.activated_at is not None:
-            countdown_end = config.activated_at + timedelta(seconds=countdown_sec)
+        elif activated_at_local is not None:
+            countdown_end = activated_at_local + timedelta(seconds=countdown_sec)
         if countdown_end is not None and runtime_end is not None and countdown_end > runtime_end:
             countdown_end = runtime_end
-        if countdown_end is not None and now >= countdown_end:
+        # For scheduled flash sale, window end_time is the source of truth.
+        # Countdown is visual-only and must not end campaign early.
+        if (not has_schedule) and countdown_end is not None and now_utc >= countdown_end:
             active = False
 
     return {
@@ -598,6 +877,7 @@ def _build_device_sync_plan(db: Session, device: Device) -> dict:
         if media_row is None:
             continue
         priority, required_by = priority_by_media[media_id]
+        variants = _media_variant_paths(media_row)
         size = int(media_row.size or 0)
         total_bytes += size
         action = "skip" if media_id in cached_ids else "download"
@@ -608,7 +888,10 @@ def _build_device_sync_plan(db: Session, device: Device) -> dict:
             {
                 "media_id": media_id,
                 "name": media_row.name,
-                "path": media_row.path,
+                "path": variants["display_path"],
+                "display_path": variants["display_path"],
+                "thumb_path": variants["thumb_path"],
+                "high_path": variants["high_path"],
                 "checksum": media_row.checksum,
                 "size": size,
                 "priority": priority,
@@ -933,7 +1216,7 @@ def _summarize_sync_items(db: Session, device_id: str, plan_revision: str) -> di
 def media_cache_report(
     device_id: str,
     request: Request,
-    media_ids: list[str] = Body(default=[]),
+    payload: dict | list[str] | None = Body(default=None),
     account_id: str | None = None,
     db: Session = Depends(get_db),
 ):
@@ -942,15 +1225,51 @@ def media_cache_report(
         raise HTTPException(status_code=404, detail="Device not found")
     _enforce_device_owner(device, _resolve_account_id(request, account_id))
 
-    normalized = _normalize_media_id_set(media_ids)
-    device.cached_media_ids = ",".join(normalized)
+    low_ids: list[str] = []
+    normal_ids: list[str] = []
+    high_ids: list[str] = []
+    if isinstance(payload, list):
+        normal_ids = _normalize_media_id_set(payload)
+        low_ids = list(normal_ids)
+    elif isinstance(payload, dict):
+        low_ids = _normalize_media_id_set(
+            payload.get("low_ids") if isinstance(payload.get("low_ids"), list) else []
+        )
+        normal_ids = _normalize_media_id_set(
+            payload.get("normal_ids")
+            if isinstance(payload.get("normal_ids"), list)
+            else (
+                payload.get("media_ids")
+                if isinstance(payload.get("media_ids"), list)
+                else []
+            )
+        )
+        high_ids = _normalize_media_id_set(
+            payload.get("high_ids") if isinstance(payload.get("high_ids"), list) else []
+        )
+        if not low_ids:
+            low_ids = list(normal_ids)
+    else:
+        normal_ids = []
+        low_ids = []
+        high_ids = []
+
+    device.cached_media_low_ids = ",".join(low_ids)
+    device.cached_media_ids = ",".join(normal_ids)
+    device.cached_media_high_ids = ",".join(high_ids)
     device.media_cache_updated_at = datetime.utcnow()
     db.commit()
+
+    tier = _compute_media_tier_status(db, device)
 
     return {
         "ok": True,
         "device_id": str(device.id),
-        "cached_count": len(normalized),
+        "cached_count": len(normal_ids),
+        "cached_low_count": len(low_ids),
+        "cached_high_count": len(high_ids),
+        "tier_level": tier["tier_level"],
+        "tier_label": tier["tier_label"],
         "updated_at": device.media_cache_updated_at.isoformat() if device.media_cache_updated_at else None,
     }
 
@@ -966,7 +1285,11 @@ def media_cache_status(
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
     _enforce_device_owner(device, _resolve_account_id(request, account_id))
-    return {"device_id": str(device.id), **_compute_media_cache_status(db, device)}
+    return {
+        "device_id": str(device.id),
+        **_compute_media_cache_status(db, device),
+        "tier": _compute_media_tier_status(db, device),
+    }
 
 
 @router.post("/{device_id}/request-media-download")
@@ -1051,21 +1374,31 @@ def device_download_channel(
 
     queue_items = []
     for row in chunk:
-        path = str(row.get("path", "")).strip()
-        if not path:
+        display_path = str(row.get("display_path") or row.get("path") or "").strip()
+        thumb_path = str(row.get("thumb_path") or display_path).strip()
+        high_path = str(row.get("high_path") or display_path).strip()
+        if not display_path:
             continue
-        urls = [f"{base}{path}" for base in base_urls]
+        display_urls = [f"{base}{display_path}" for base in base_urls]
+        thumb_urls = [f"{base}{thumb_path}" for base in base_urls]
+        high_urls = [f"{base}{high_path}" for base in base_urls]
         queue_items.append(
             {
                 "media_id": str(row.get("media_id", "")).strip(),
                 "name": row.get("name"),
-                "path": path,
+                "path": display_path,
+                "display_path": display_path,
+                "thumb_path": thumb_path,
+                "high_path": high_path,
                 "size": int(row.get("size", 0) or 0),
                 "checksum": row.get("checksum"),
                 "priority": row.get("priority"),
                 "required_by": row.get("required_by"),
                 "action": row.get("action"),
-                "urls": urls,
+                "urls": display_urls,
+                "display_urls": display_urls,
+                "thumb_urls": thumb_urls,
+                "high_urls": high_urls,
             }
         )
 
@@ -1130,21 +1463,25 @@ def device_sync_progress(
     state.last_report_at = datetime.utcnow()
 
     revision = str(state.plan_revision or "").strip()
+    auto_compress_events: list[dict] = []
     if revision:
         completion_set = {str(item).strip() for item in (completed_ids or []) if str(item).strip()}
         if completion_set:
-            rows = (
+            (
                 db.query(DeviceSyncItem)
                 .filter(
                     DeviceSyncItem.device_id == str(device.id),
                     DeviceSyncItem.plan_revision == revision,
                     DeviceSyncItem.media_id.in_(list(completion_set)),
                 )
-                .all()
+                .update(
+                    {
+                        DeviceSyncItem.status: "completed",
+                        DeviceSyncItem.error: None,
+                    },
+                    synchronize_session=False,
+                )
             )
-            for row in rows:
-                row.status = "completed"
-                row.error = None
 
         for row in failed_items or []:
             if not isinstance(row, dict):
@@ -1152,8 +1489,8 @@ def device_sync_progress(
             media_id = str(row.get("media_id", "")).strip()
             if not media_id:
                 continue
-            sync_item = (
-                db.query(DeviceSyncItem)
+            existing = (
+                db.query(DeviceSyncItem.retry_count)
                 .filter(
                     DeviceSyncItem.device_id == str(device.id),
                     DeviceSyncItem.plan_revision == revision,
@@ -1161,13 +1498,51 @@ def device_sync_progress(
                 )
                 .first()
             )
-            if not sync_item:
+            if existing is None:
                 continue
-            sync_item.status = "failed"
-            sync_item.error = str(row.get("error", "")).strip() or "download_failed"
+            error_value = str(row.get("error", "")).strip() or "download_failed"
             retry_value = row.get("retry_count")
+            effective_retry_count = int(existing[0] or 0)
             if isinstance(retry_value, int) and retry_value >= 0:
-                sync_item.retry_count = retry_value
+                effective_retry_count = retry_value
+            else:
+                effective_retry_count = int(existing[0] or 0) + 1
+
+            (
+                db.query(DeviceSyncItem)
+                .filter(
+                    DeviceSyncItem.device_id == str(device.id),
+                    DeviceSyncItem.plan_revision == revision,
+                    DeviceSyncItem.media_id == media_id,
+                )
+                .update(
+                    {
+                        DeviceSyncItem.status: "failed",
+                        DeviceSyncItem.error: error_value,
+                        DeviceSyncItem.retry_count: effective_retry_count,
+                    },
+                    synchronize_session=False,
+                )
+            )
+
+            optimize_result = _auto_optimize_media_on_repeated_failure(
+                db,
+                media_id,
+                retry_count=effective_retry_count,
+                error=error_value,
+            )
+            if optimize_result.get("optimized") is True:
+                auto_compress_events.append(optimize_result)
+
+        if auto_compress_events:
+            # Regenerate sync plan so player receives new path/checksum for optimized media.
+            db.flush()
+            refreshed_plan = _build_device_sync_plan(db, device)
+            _persist_device_sync_plan(db, str(device.id), refreshed_plan)
+            revision = str(state.plan_revision or "").strip()
+            state.last_error = (
+                f"auto_compress_requeued:{len(auto_compress_events)}"
+            )
 
         summary = _summarize_sync_items(db, str(device.id), revision)
         state.completed_count = int(summary["completed_count"])
@@ -1189,6 +1564,7 @@ def device_sync_progress(
     return {
         "ok": True,
         "device_id": str(device.id),
+        "auto_compress_events": auto_compress_events,
         **_device_sync_status_payload(db, str(device.id)),
     }
 
@@ -1445,6 +1821,7 @@ def list_devices(request: Request, account_id: str | None = None, db: Session = 
     return_data = []
     for d in devices:
         media_cache_status = _compute_media_cache_status(db, d)
+        media_tier_status = _compute_media_tier_status(db, d)
         sync_status = _device_sync_status_payload(db, str(d.id))
         download_overview = _download_overview(sync_status, media_cache_status)
         sync_total_items = (
@@ -1473,6 +1850,16 @@ def list_devices(request: Request, account_id: str | None = None, db: Session = 
                 "media_cached_count": media_cache_status["cached_count"],
                 "media_missing_count": media_cache_status["missing_count"],
                 "media_cache_updated_at": media_cache_status["cache_updated_at"],
+                "media_tier_level": media_tier_status["tier_level"],
+                "media_tier_label": media_tier_status["tier_label"],
+                "media_tier_color": media_tier_status["tier_color"],
+                "media_tier_required_count": media_tier_status["required_count"],
+                "media_tier_low_ready_count": media_tier_status["low_ready_count"],
+                "media_tier_normal_ready_count": media_tier_status["normal_ready_count"],
+                "media_tier_high_ready_count": media_tier_status["high_ready_count"],
+                "media_tier_low_ready": media_tier_status["low_ready"],
+                "media_tier_normal_ready": media_tier_status["normal_ready"],
+                "media_tier_high_ready": media_tier_status["high_ready"],
                 "sync_queue_status": sync_status.get("queue_status"),
                 "sync_progress_percent": int(sync_status.get("progress_percent", 0) or 0),
                 "sync_total_items": sync_total_items,
@@ -1630,6 +2017,23 @@ def device_config(device_id: str, request: Request, account_id: str | None = Non
     if media_ids:
         media = db.query(Media).filter(Media.id.in_(list(media_ids))).all()
 
+    media_payload = []
+    for m in media:
+        variants = _media_variant_paths(m)
+        media_payload.append(
+            {
+                "id": str(m.id),
+                "type": m.type,
+                "path": variants["display_path"],
+                "display_path": variants["display_path"],
+                "thumb_path": variants["thumb_path"],
+                "high_path": variants["high_path"],
+                "checksum": m.checksum,
+                "duration_sec": m.duration_sec,
+                "size": m.size,
+            }
+        )
+
     return {
         "device_id": str(device.id),
         "device": {
@@ -1686,16 +2090,6 @@ def device_config(device_id: str, request: Request, account_id: str | None = Non
             }
             for pl in playlists
         ],
-        "media": [
-            {
-                "id": str(m.id),
-                "type": m.type,
-                "path": m.path,
-                "checksum": m.checksum,
-                "duration_sec": m.duration_sec,
-                "size": m.size,
-            }
-            for m in media
-        ],
+        "media": media_payload,
         "flash_sale": flash_sale_runtime,
     }

@@ -14,5 +14,7 @@ class Device(Base):
     last_seen = Column(DateTime)
     status = Column(String, default="offline")
     orientation = Column(String, default="portrait")
+    cached_media_low_ids = Column(Text, nullable=True)
     cached_media_ids = Column(Text, nullable=True)
+    cached_media_high_ids = Column(Text, nullable=True)
     media_cache_updated_at = Column(DateTime, nullable=True)
