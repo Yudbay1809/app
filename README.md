@@ -13,6 +13,9 @@ FastAPI backend for digital signage operations: media catalog, playlists, schedu
 - Validated with end-to-end API + websocket smoke tests before release.
 
 ## Latest Updates (2026-02-17)
+- Playlist API enhancement:
+  - `GET /playlists?include_all=true` returns global playlists across device/screen.
+  - Response now includes `device_id`, `device_name`, `screen_name` for playlist management UI context.
 - Flash Sale schedule now supports date range (`start_date`, `end_date`) with `YYYY-MM-DD` format.
   - Allows non-recurring campaign windows (example: only active between 2026-03-01 and 2026-03-03).
   - Runtime activation checks date range + schedule time before marking campaign active.

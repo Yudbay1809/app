@@ -7,6 +7,7 @@ from app.models.playlist import Playlist, PlaylistItem
 from app.models.media import Media
 from app.models.schedule import Schedule
 from app.models.screen import Screen
+from app.models.device import Device
 
 router = APIRouter(prefix="/playlists", tags=["playlists"])
 
@@ -130,9 +131,62 @@ def create_playlist(
     return playlist
 
 @router.get("")
-def list_playlists(screen_id: str, db: Session = Depends(get_db)):
-    screen_id = _normalize_entity_id(screen_id, "screen_id")
-    return db.query(Playlist).filter(Playlist.screen_id == screen_id).all()
+def list_playlists(
+    screen_id: str | None = None,
+    include_all: bool = False,
+    db: Session = Depends(get_db),
+):
+    query = db.query(Playlist)
+    normalized_screen_id = (screen_id or "").strip()
+    if normalized_screen_id and not include_all:
+        normalized_screen_id = _normalize_entity_id(normalized_screen_id, "screen_id")
+        query = query.filter(Playlist.screen_id == normalized_screen_id)
+    rows = query.order_by(Playlist.name.asc(), Playlist.id.asc()).all()
+
+    if not rows:
+        return []
+
+    screen_ids = sorted({str(item.screen_id) for item in rows if item.screen_id})
+    screen_map: dict[str, Screen] = {}
+    if screen_ids:
+        screen_map = {
+            str(item.id): item
+            for item in db.query(Screen).filter(Screen.id.in_(screen_ids)).all()
+        }
+
+    device_ids = sorted(
+        {
+            str(item.device_id)
+            for item in screen_map.values()
+            if getattr(item, "device_id", None)
+        }
+    )
+    device_map: dict[str, Device] = {}
+    if device_ids:
+        device_map = {
+            str(item.id): item
+            for item in db.query(Device).filter(Device.id.in_(device_ids)).all()
+        }
+
+    output: list[dict] = []
+    for item in rows:
+        screen = screen_map.get(str(item.screen_id))
+        device = device_map.get(str(screen.device_id)) if screen else None
+        output.append(
+            {
+                "id": item.id,
+                "name": item.name,
+                "screen_id": item.screen_id,
+                "is_flash_sale": bool(item.is_flash_sale),
+                "flash_note": item.flash_note,
+                "flash_countdown_sec": item.flash_countdown_sec,
+                "flash_items_json": item.flash_items_json,
+                "device_id": str(device.id) if device else None,
+                "device_name": (device.name if device else None),
+                "screen_name": (screen.name if screen else None),
+            }
+        )
+    return output
 
 @router.put("/{playlist_id}")
 def update_playlist(
