@@ -6,7 +6,18 @@ import re
 
 DATABASE_URL = "sqlite:///./signage.db"  # ganti ke postgres nanti
 
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+POOL_SIZE = int(os.getenv("SIGNAGE_DB_POOL_SIZE", "15"))
+MAX_OVERFLOW = int(os.getenv("SIGNAGE_DB_MAX_OVERFLOW", "30"))
+POOL_TIMEOUT = int(os.getenv("SIGNAGE_DB_POOL_TIMEOUT", "60"))
+
+engine = create_engine(
+    DATABASE_URL,
+    connect_args={"check_same_thread": False},
+    pool_size=POOL_SIZE,
+    max_overflow=MAX_OVERFLOW,
+    pool_timeout=POOL_TIMEOUT,
+    pool_pre_ping=True,
+)
 SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
 
 Base = declarative_base()

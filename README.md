@@ -16,6 +16,7 @@ FastAPI backend for digital signage operations: media catalog, playlists, schedu
 - Auto compress saat upload media:
   - image otomatis resize + kompres JPEG untuk perangkat RAM 2GB.
   - video otomatis ditranscode jika besar (jika `ffmpeg` tersedia).
+- Pool database ditingkatkan untuk mencegah timeout koneksi saat traffic tinggi.
 - Playlist API enhancement:
   - `GET /playlists?include_all=true` returns global playlists across device/screen.
   - Response now includes `device_id`, `device_name`, `screen_name` for playlist management UI context.
