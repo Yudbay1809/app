@@ -12,7 +12,10 @@ FastAPI backend for digital signage operations: media catalog, playlists, schedu
 - Server IP selection on Windows prioritizes adapter with Default Gateway to improve `GET /healthz` and `GET /server-info` accuracy.
 - Validated with end-to-end API + websocket smoke tests before release.
 
-## Latest Updates (2026-02-17)
+## Latest Updates (2026-03-22)
+- Auto compress saat upload media:
+  - image otomatis resize + kompres JPEG untuk perangkat RAM 2GB.
+  - video otomatis ditranscode jika besar (jika `ffmpeg` tersedia).
 - Playlist API enhancement:
   - `GET /playlists?include_all=true` returns global playlists across device/screen.
   - Response now includes `device_id`, `device_name`, `screen_name` for playlist management UI context.
